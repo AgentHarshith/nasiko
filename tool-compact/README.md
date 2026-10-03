@@ -50,7 +50,8 @@ assert_eq!(decoded.content, "Booking it.\n");
 ```
 
 The router assigns call ids, decides placement and enablement, and maps `kind != "function"`
-tools out before calling this crate.
+tools out before calling this crate. In Nasiko, enablement is the operator's `TOKEN_COMPACT_TOOLS`
+flag plus each agent's own switch (`agents.compact_tools_enabled`, on the agent's Settings tab).
 
 ## Public API
 
