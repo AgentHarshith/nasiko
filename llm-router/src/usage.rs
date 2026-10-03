@@ -69,6 +69,12 @@ pub struct UsageRecord {
     /// Total text bytes actually sent, after compression and the brevity directive. Calibrates
     /// chars-per-token against this very call rather than a fixed divisor (see `savings.rs`).
     pub request_bytes: Option<usize>,
+    /// Pre-serialized `metadata.compact_tools` block (`compact_tools.rs`).
+    ///
+    /// `None` while the feature is off, so the row stays byte-identical to today's; once the
+    /// fleet flag is on it is always `Some`, recording "applied" or "bypassed, and why" like the
+    /// brevity block does.
+    pub compact_tools_metadata: Option<serde_json::Value>,
 }
 
 /// Spawn the usage write so it never blocks the response.
@@ -161,6 +167,7 @@ pub async fn log_usage(
         cache_creation: serde_json::to_value(&cache_details).unwrap_or(serde_json::Value::Null),
         compress: record.compress_metadata,
         brevity: record.brevity_metadata,
+        compact_tools: record.compact_tools_metadata,
     });
 
     sqlx::query(
@@ -281,6 +288,8 @@ struct MetadataInputs {
     compress: Option<serde_json::Value>,
     /// Always `Some` once the brevity layer exists: it records "skipped, and why" too.
     brevity: Option<serde_json::Value>,
+    /// `None` while compact tool definitions are off for the deployment.
+    compact_tools: Option<serde_json::Value>,
 }
 
 /// The row's `metadata` JSONB.
@@ -300,6 +309,9 @@ fn build_metadata(inputs: MetadataInputs) -> serde_json::Value {
     }
     if let Some(brevity) = inputs.brevity {
         metadata["brevity"] = brevity;
+    }
+    if let Some(compact_tools) = inputs.compact_tools {
+        metadata["compact_tools"] = compact_tools;
     }
     metadata
 }
@@ -321,6 +333,7 @@ mod tests {
             cache_creation: serde_json::Value::Null,
             compress: None,
             brevity: None,
+            compact_tools: None,
         }
     }
 
@@ -345,6 +358,18 @@ mod tests {
             })
         );
         assert_eq!(build_metadata(inputs(false))["key_source"], "user_secret");
+    }
+
+    #[test]
+    fn compact_tools_block_is_added_under_its_own_key_only_when_present() {
+        let block = serde_json::json!({ "applied": true, "bypass": null, "calls": 1 });
+        let metadata = build_metadata(MetadataInputs {
+            compact_tools: Some(block.clone()),
+            ..inputs(true)
+        });
+        assert_eq!(metadata["compact_tools"], block);
+        assert_eq!(metadata["key_source"], "platform");
+        assert!(build_metadata(inputs(true)).get("compact_tools").is_none());
     }
 
     #[test]

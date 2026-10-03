@@ -788,6 +788,8 @@ impl AttemptGuard {
                 // Nothing was compressed, so there is nothing to credit to a savings layer.
                 compress_bytes: None,
                 request_bytes: None,
+                // Compact tool definitions run only in `chat_core`; this surface never sees them.
+                compact_tools_metadata: None,
             }),
         }
     }
@@ -860,6 +862,7 @@ fn log_response_usage(
             brevity_metadata: None,
             compress_bytes: None,
             request_bytes: None,
+            compact_tools_metadata: None,
         },
     );
 }
@@ -926,7 +929,7 @@ fn error_code(error: &GatewayError) -> &'static str {
         GatewayError::NoRegistryEntry(_)
         | GatewayError::SecretNotFound(_, _)
         | GatewayError::NoApiKey => "routing_configuration_error",
-        GatewayError::Upstream(_) => "upstream_error",
+        GatewayError::Upstream(_) | GatewayError::CompactToolDecode(_) => "upstream_error",
         GatewayError::Internal(_) => "internal_error",
     }
 }

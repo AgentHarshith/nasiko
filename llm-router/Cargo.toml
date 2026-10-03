@@ -19,6 +19,9 @@ nasiko-pricing.workspace = true
 nasiko-savings.workspace = true
 # Internal — structural payload compression at the egress seam (src/compress.rs)
 nasiko-compress.workspace = true
+# Internal — compact tool catalog + `<<call …>>` decoder (src/compact_tools.rs). A direct path
+# rather than a workspace entry keeps the root manifest change to the new member alone.
+nasiko-tool-compact = { path = "../tool-compact" }
 
 # Web / async
 axum = { workspace = true }

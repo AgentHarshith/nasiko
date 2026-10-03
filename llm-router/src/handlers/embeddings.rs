@@ -106,6 +106,8 @@ async fn embeddings_core(
             // Nothing was compressed, so there is nothing to credit to a savings layer.
             compress_bytes: None,
             request_bytes: None,
+            // Embeddings carry no tools; compact tool definitions never run here.
+            compact_tools_metadata: None,
             platform_paid: resolved.platform_paid,
         },
     );
