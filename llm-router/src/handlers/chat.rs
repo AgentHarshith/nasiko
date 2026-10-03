@@ -307,8 +307,13 @@ async fn chat_core(
         &ctx.cfg,
         resolved.compact_tools_enabled,
     );
+    // The uncompacted request is kept only when a decode failure may re-send it natively.
+    let mut native_retry_req = None;
     let compiled = match &compact_plan {
         crate::compact_tools::Plan::Apply(c) => {
+            if ctx.cfg.compact_tools_native_retry && !req.is_streaming() {
+                native_retry_req = Some(req.clone());
+            }
             crate::compact_tools::apply(&mut req, c);
             Some(c)
         }
@@ -425,12 +430,13 @@ async fn chat_core(
     llm_span.record("gen_ai.response.model", model.as_str());
     record_span_usage(&llm_span, resp.usage.as_ref());
 
+    // Identity fields are cloned: a native retry below logs a second row for the same request.
     usage::spawn_log_with(
         ctx.db.clone(),
         ctx.pricing.clone(),
         UsageRecord {
-            owner_id,
-            agent_id,
+            owner_id: owner_id.clone(),
+            agent_id: agent_id.clone(),
             operation_type: "direct_llm",
             provider,
             model,
@@ -440,7 +446,7 @@ async fn chat_core(
             latency_ms,
             streaming: false,
             finish_reason: resp.choices.first().and_then(|c| c.finish_reason.clone()),
-            flow_id,
+            flow_id: flow_id.clone(),
             attribution_source,
             platform_paid,
             compress_metadata: compression.to_metadata(),
@@ -455,9 +461,52 @@ async fn chat_core(
         tracing::warn!(
             target: "nasiko::llm_router::compact_tools",
             kind = %failure.kind,
+            native_retry = native_retry_req.is_some(),
             "compact_tools: reply could not be decoded into tool calls"
         );
-        return Err(GatewayError::CompactToolDecode(failure.kind));
+        let (Some(native_req), Some(compiled)) = (native_retry_req, compiled) else {
+            return Err(GatewayError::CompactToolDecode(failure.kind));
+        };
+        // One native re-send of the original request through the same fallback chain. Its reply
+        // is checked by the same finalization against the same original schemas, so a native
+        // reply with an invalid call is still refused; there is no second retry.
+        let retry_started = Instant::now();
+        let (mut resp, (provider, model)) =
+            fallback::execute_chat(&ctx.http, &ctx.cfg, &resolved, &native_req)
+                .instrument(llm_span.clone())
+                .await?;
+        let retry_outcome = crate::compact_tools::restore(&mut resp, compiled);
+        llm_span.record("gen_ai.response.model", model.as_str());
+        record_span_usage(&llm_span, resp.usage.as_ref());
+        usage::spawn_log_with(
+            ctx.db.clone(),
+            ctx.pricing.clone(),
+            UsageRecord {
+                owner_id,
+                agent_id,
+                operation_type: "direct_llm",
+                provider,
+                model,
+                usage: resp.usage.clone(),
+                cached_tokens: None,
+                reasoning_tokens: None,
+                latency_ms: retry_started.elapsed().as_millis() as i64,
+                streaming: false,
+                finish_reason: resp.choices.first().and_then(|c| c.finish_reason.clone()),
+                flow_id,
+                attribution_source,
+                platform_paid,
+                compress_metadata: compression.to_metadata(),
+                brevity_metadata,
+                compress_bytes,
+                request_bytes: Some(crate::brevity::estimated_bytes(&native_req)),
+            },
+            Some(crate::compact_tools::native_retry_metadata(&failure)),
+        );
+        if let Err(retry_failure) = retry_outcome {
+            return Err(GatewayError::CompactToolDecode(retry_failure.kind));
+        }
+        return Ok(Json(inbound.render_chat_response(resp)).into_response());
     }
 
     Ok(Json(inbound.render_chat_response(resp)).into_response())
@@ -1614,14 +1663,21 @@ mod tests {
     //
     // `compact_tools::tests` covers plan/apply/finalize on IR values. These prove the wiring:
     // what the provider is actually sent with the flag off and on, every bypass that is reachable
-    // through `chat_core`, and that a reply the decoder refuses becomes a 502 with no calls.
+    // through `chat_core`, that a reply the decoder refuses becomes a 502 with no calls when the
+    // native retry is off, and that with it on the original request is re-sent exactly once.
 
     /// `ctx_with` plus the compact-tools flag. Brevity's holdout is zeroed so the directive is
-    /// deterministic when a test turns the agent's optimization switch on.
+    /// deterministic when a test turns the agent's optimization switch on. The native retry is
+    /// off here so each exchange is exactly one provider call; the retry tests turn it on.
     fn compact_ctx(base: String, enabled: bool) -> LlmRouterCtx {
+        compact_ctx_with_retry(base, enabled, false)
+    }
+
+    fn compact_ctx_with_retry(base: String, enabled: bool, native_retry: bool) -> LlmRouterCtx {
         let mut ctx = ctx_with(base);
         let mut cfg = (*ctx.cfg).clone();
         cfg.compact_tools_enabled = enabled;
+        cfg.compact_tools_native_retry = native_retry;
         cfg.brevity_holdout_pct = 0;
         ctx.cfg = Arc::new(cfg);
         ctx
@@ -1733,6 +1789,119 @@ mod tests {
             Err(GatewayError::CompactToolDecode(kind)) => kind,
             other => panic!("expected a decode failure, got {other:?}"),
         }
+    }
+
+    /// `exchange` with the native retry on and a provider that answers the compacted request
+    /// (no `tools` on the wire) with `compact_reply` and the native one with `native_reply`.
+    /// Returns every body the provider received, in order, and the handler's result.
+    async fn exchange_with_retry(
+        request: Value,
+        compact_reply: Value,
+        native_reply: Value,
+    ) -> (Vec<Value>, Result<Value, GatewayError>) {
+        let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let capture = Arc::clone(&seen);
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |request| {
+                let body = request.body().map(Vec::as_slice).unwrap_or_default();
+                let sent: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+                let answer = if sent.get("tools").is_some() {
+                    &native_reply
+                } else {
+                    &compact_reply
+                };
+                let out = answer.to_string().into_bytes();
+                capture.lock().unwrap_or_else(|e| e.into_inner()).push(sent);
+                out
+            })
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let ctx = compact_ctx_with_retry(server.url(), true, true);
+        let result = chat_core(
+            &ctx,
+            &plain_store(),
+            &auth_headers(&token()),
+            request,
+            InboundFormat::OpenAi,
+            None,
+        )
+        .await;
+        mock.assert_async().await;
+        let bodies = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let result = match result {
+            Ok(resp) => Ok(serde_json::from_str(&body_string(resp).await).unwrap()),
+            Err(e) => Err(e),
+        };
+        (bodies, result)
+    }
+
+    #[tokio::test]
+    async fn a_refused_compact_reply_is_retried_once_with_the_original_request() {
+        let native_calls = json!([{"id": "call_up1", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}]);
+        let (bodies, result) = exchange_with_retry(
+            tools_request(),
+            call_reply("<<call get_weather {\"city\":\"Paris\",\"unit\":\"kelvin\"}>>"),
+            reply(Value::Null, json!("tool_calls"), Some(native_calls)),
+        )
+        .await;
+        assert_eq!(
+            bodies.len(),
+            2,
+            "one compacted attempt, one native retry: {bodies:?}"
+        );
+        assert!(
+            bodies[0].get("tools").is_none(),
+            "first attempt is compacted"
+        );
+        // The retry is the original request, byte for byte what the flag-off path would send.
+        let mut expected = tools_request();
+        expected["stream"] = json!(false);
+        assert_eq!(bodies[1], expected);
+        let body = result.expect("the native retry's reply is released");
+        let calls = &body["choices"][0]["message"]["tool_calls"];
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"city\":\"Paris\"}");
+    }
+
+    #[tokio::test]
+    async fn a_native_retry_reply_with_an_invalid_call_is_still_refused() {
+        // The retry does not relax validation: the native reply is checked against the same
+        // original schemas, and there is no second retry.
+        let bad_native = json!([{"id": "call_up1", "type": "function",
+            "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\",\"unit\":\"kelvin\"}"}}]);
+        let (bodies, result) = exchange_with_retry(
+            tools_request(),
+            call_reply("<<call delete_everything {}>>"),
+            reply(Value::Null, json!("tool_calls"), Some(bad_native)),
+        )
+        .await;
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        assert!(matches!(
+            result,
+            Err(GatewayError::CompactToolDecode(ref k)) if k == "invalid_arguments"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_decodable_compact_reply_is_not_retried() {
+        let (bodies, result) = exchange_with_retry(
+            tools_request(),
+            call_reply("<<call get_weather {\"city\":\"Paris\"}>>"),
+            reply(json!("unused"), json!("stop"), None),
+        )
+        .await;
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        let body = result.unwrap();
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
     }
 
     #[tokio::test]

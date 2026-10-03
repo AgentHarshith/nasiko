@@ -163,8 +163,15 @@ pub struct GatewayConfig {
     /// router and the model rather than shrinking a payload, so it is opt-in per deployment
     /// until adherence has been measured for the models in use. The per-agent `compress_enabled`
     /// switch is deliberately NOT consulted: it was consented to for payload compression, not
-    /// for this. A per-agent opt-in is the natural next step and lives outside this crate.
+    /// for this; each agent opts in separately (`agents.compact_tools_enabled`).
     pub compact_tools_enabled: bool,
+
+    /// When a compacted reply cannot be decoded into valid tool calls, re-send the original
+    /// (uncompacted) request once through the same provider chain instead of failing the call.
+    /// The failed attempt was billed and keeps its own usage row; the retry gets a second row.
+    /// The retried reply's native tool calls are still validated against the original schemas,
+    /// so no invalid call is released either way. Defaults on; `false` restores the strict 502.
+    pub compact_tools_native_retry: bool,
 }
 
 impl Default for GatewayConfig {
@@ -208,6 +215,7 @@ impl Default for GatewayConfig {
             compress_recovery_min_bytes: 8192,
             compress_recovery_ttl_secs: 86_400,
             compact_tools_enabled: false,
+            compact_tools_native_retry: true,
         }
     }
 }
@@ -321,6 +329,10 @@ impl GatewayConfig {
                 d.compress_recovery_ttl_secs as usize,
             ) as u64,
             compact_tools_enabled: env_flag("TOKEN_COMPACT_TOOLS", d.compact_tools_enabled),
+            compact_tools_native_retry: env_flag(
+                "TOKEN_COMPACT_TOOLS_NATIVE_RETRY",
+                d.compact_tools_native_retry,
+            ),
         }
     }
 
@@ -432,6 +444,8 @@ mod tests {
     #[test]
     fn compact_tools_defaults_off_and_follows_the_shared_flag_rule() {
         assert!(!GatewayConfig::default().compact_tools_enabled);
+        // The retry only matters once the feature is on; it is the safer default there.
+        assert!(GatewayConfig::default().compact_tools_native_retry);
         for (value, default, expected) in [
             (Some("true"), false, true),
             (Some("1"), false, true),

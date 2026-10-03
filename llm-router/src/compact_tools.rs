@@ -474,6 +474,24 @@ pub fn to_metadata(
     }
 }
 
+/// Usage metadata for the native re-send that follows a compacted reply the decoder refused
+/// (`GatewayConfig::compact_tools_native_retry`). The request on the wire was the original one,
+/// so nothing was applied; `retry_after` names the failure that caused the second, billed call
+/// so the two usage rows can be read together.
+pub fn native_retry_metadata(failure: &DecodeFailure) -> Value {
+    json!({
+        "applied": false,
+        "bypass": "native_retry",
+        "retry_after": failure.kind,
+        "tool_count": null,
+        "definitions_bytes_in": null,
+        "definitions_bytes_out": null,
+        "decode": null,
+        "representation": null,
+        "calls": null,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

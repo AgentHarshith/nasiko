@@ -70,7 +70,9 @@ examples/fixtures/compact-tools/  development and held-out evaluation sets
 `LLM_CONFIG_CACHE_TTL` (30s), `{OPENAI,ANTHROPIC,GEMINI}_API_BASE` (test overrides).
 Reuses the platform's `SECRETS_ENCRYPTION_KEY` (per-user HKDF AES-256-GCM) and
 `DATABASE_URL`. `TOKEN_COMPACT_TOOLS` (default `false`) turns on compact tool definitions
-(below); like every `TOKEN_*` flag it accepts `true`/`1` and `false`/`0`.
+(below), and `TOKEN_COMPACT_TOOLS_NATIVE_RETRY` (default `true`) re-sends a request natively once
+when its compacted reply cannot be decoded; like every `TOKEN_*` flag they accept `true`/`1` and
+`false`/`0`.
 
 Storage: `agents.llm_config` (JSONB; NULL → defaults), `user_secrets` (decrypt via
 `SecretsCrypto::try_for_user`), `token_usage` (written), `model_pricing` (cost trigger).
@@ -111,10 +113,15 @@ After dispatch the reply is judged by its representation:
   aggregate size, all checked before parsing); valid ones are kept as is, any violation rejects
   the whole reply.
 - Mixing both, more than one choice, a truncated/filtered/missing completion with executable
-  output, an unknown tool, invalid or malformed arguments: **502**
-  `{"detail":"compact tool call decoding failed: <kind>"}`. The body carries only the kind, never
-  model text. Usage is recorded for the billed call first. The router never retries or re-decodes;
-  SDKs that retry 5xx will re-sample, which is the intended remedy.
+  output, an unknown tool, invalid or malformed arguments: the compacted reply is refused. Usage
+  is recorded for that billed call first (`decode: <kind>`). Then, with
+  `TOKEN_COMPACT_TOOLS_NATIVE_RETRY` on (the default), the original uncompacted request is re-sent
+  once through the same fallback chain and logged as a second usage row (`bypass: "native_retry"`,
+  `retry_after: <kind>`). Its reply goes through the same finalization against the same original
+  schemas, so an invalid native call is still refused, and there is no second retry. With the
+  retry off, or when the retried reply is refused, the result is **502**
+  `{"detail":"compact tool call decoding failed: <kind>"}`; the body carries only the kind, never
+  model text.
 - A plain text reply passes through untouched, whatever its finish reason.
 
 The usage row's `metadata.compact_tools` block is present whenever the flag is on:
@@ -122,9 +129,10 @@ The usage row's `metadata.compact_tools` block is present whenever the flag is o
 representation, calls}` (sizes are bytes, not tokens).
 
 Not covered yet: streaming through the router, Anthropic/Gemini inbound, conversation history
-with earlier tool calls, forced `tool_choice`, the `/v1/responses` surface. Per-agent opt-in is
-a separate change; in this crate the fleet flag is the only switch, and the per-agent
-`compress_enabled` switch is deliberately not reused as consent.
+with earlier tool calls, forced `tool_choice`, the `/v1/responses` surface. Enablement needs both
+the fleet flag and the agent's own opt-in (`agents.compact_tools_enabled`, the "Compact tool
+definitions" switch on its Settings tab); the per-agent `compress_enabled` switch is deliberately
+not reused as consent.
 
 ### Evaluation and measurement
 
@@ -142,9 +150,10 @@ OUT=/tmp/measure.md EVAL_SET=/tmp/compact-tools-eval.json \
 cargo run --release -p nasiko-llm-router --example compact_tools_measure
 ```
 
-In live mode a reply counts as judged only when it finished (`finish_reason` `stop` or
-`tool_calls`); a missing, truncated or filtered completion is reported as `incomplete_completion`
-even when it carries no call, which is stricter than the router's own passthrough. The measurement
+In live mode each reply is judged by the production finalization: a missing, truncated or
+filtered completion that carries call output is `incomplete_completion`, and one with no
+executable output counts as a reply with zero calls, exactly as the router passes it through. The
+measurement
 report's adherence rate is matched divided by every attempted case (matched, mismatched and output
 failures); transport errors and skipped cases are listed beside it, not inside it.
 
