@@ -183,11 +183,16 @@ fn malformed_json_duplicate_keys_and_bad_framing_fail() {
     );
     assert_eq!(err("<<call noop").kind(), "incomplete_call");
     assert_eq!(err("<<call ").kind(), "incomplete_call");
-    assert_eq!(err("<<call noop >>").kind(), "malformed_call");
     assert_eq!(err("<<call noop {} x>>").kind(), "malformed_call");
     assert_eq!(err("<<call noop {}>x").kind(), "malformed_call");
     assert_eq!(err("<<call no$op {}>>").kind(), "malformed_call");
     assert_eq!(err("<<call noop []>>").kind(), "malformed_call");
+    assert_eq!(err("<<call noop (x)>>").kind(), "malformed_call");
+    assert_eq!(err("<<call noop ({})>>").kind(), "malformed_call");
+    assert_eq!(err("<<call noop ()x>>").kind(), "malformed_call");
+    assert_eq!(err("<<call noop (").kind(), "incomplete_call");
+    assert_eq!(err("<<call noop ()").kind(), "incomplete_call");
+    assert_eq!(err("<<call noop>").kind(), "incomplete_call");
     // A bare marker at the very end never saw the whitespace that starts a call: it stays prose.
     // One more character of whitespace and it is an open call.
     assert_eq!(ok("see <<call").0, "see <<call");
@@ -480,4 +485,35 @@ fn native_calls_obey_the_same_limits_as_the_decoder() {
             .kind(),
         "unsupported_schema"
     );
+}
+
+#[test]
+fn a_tool_without_arguments_may_be_called_with_empty_parentheses_or_nothing() {
+    let expected = vec![("noop".to_owned(), json!({}))];
+    for text in [
+        "<<call noop {}>>",
+        "<<call noop>>",
+        "<<call noop >>",
+        "<<call noop()>>",
+        "<<call noop ()>>",
+        "<<call noop ( ) >>",
+        "<<call noop(\n)>>",
+    ] {
+        let (content, calls) = ok(text);
+        assert_eq!(calls, expected, "{text:?}");
+        assert!(content.is_empty(), "{text:?}");
+    }
+    let (content, calls) = ok("Checking.\n<<call noop()>>\nDone.");
+    assert_eq!(content, "Checking.\n\nDone.");
+    assert_eq!(calls, expected);
+    // The spelling changes nothing about validation: the empty object still has to satisfy the
+    // schema, so a tool with required arguments rejects it exactly like `{}`.
+    for text in [
+        "<<call create_calendar_event>>",
+        "<<call create_calendar_event()>>",
+    ] {
+        assert_eq!(err(text).kind(), "invalid_arguments", "{text:?}");
+    }
+    assert_eq!(err("<<call missing()>>").kind(), "unknown_tool");
+    assert_eq!(err("<<call missing>>").kind(), "unknown_tool");
 }

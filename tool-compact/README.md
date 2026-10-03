@@ -182,7 +182,8 @@ request is either fully compact or fully native).
 
 ```ebnf
 output   = *( text / call )
-call     = "<<call" WS1 toolname *WSP json-object *WSP ">>"
+call     = "<<call" WS1 toolname *WSP ( json-object / "(" *WSP ")" ) *WSP ">>"
+         / "<<call" WS1 toolname *WSP ">>"
 toolname = 1*64( ALPHA / DIGIT / "_" / "." / "-" )
 text     = anything; "<<" not followed by "call" and whitespace is text
 ```
@@ -191,6 +192,10 @@ text     = anything; "<<" not followed by "call" and whitespace is text
   string/escape state and bracket depth.
 - Whitespace after the name is optional (`<<call ping{}>>` is accepted); whitespace between the
   marker and the name is required, so `<<callx` and `<<caller` are text.
+- `<<call ping>>` and `<<call ping()>>` mean `<<call ping {}>>`. Models copy the signature line
+  for a tool without arguments, so the empty object may be left out or written as `()`; anything
+  inside the parentheses is `malformed_call`, and the empty object is still validated, so a tool
+  with required arguments rejects these spellings as `invalid_arguments`.
 - Prose before, between and after calls is returned verbatim in `Decoded.content`.
 - A literal `<<call` followed by whitespace in prose cannot be escaped: it starts a call, and if
   that call does not complete validly the whole reply fails. This ambiguity is accepted and

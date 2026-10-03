@@ -20,6 +20,7 @@ fn catalog() -> Vec<ToolDef> {
             "to": {"type": "array", "items": {"type": "string"}}, "subject": {"type": "string"}, "body": {"type": "string"}
         }, "required": ["to", "subject", "body"]}),
         ),
+        tool("noop", json!({"type": "object", "properties": {}})),
     ]
 }
 
@@ -31,6 +32,11 @@ const SAMPLES: &[&str] = &[
     "<<<call create_calendar_event {\"title\":\"t\",\"start\":\"s\"}>>",
     "<<ca<<call create_calendar_event {\"title\":\"t\",\"start\":\"s\"}>>",
     "<<call unknown_tool {}>>",
+    "<<call noop>>",
+    "<<call noop()>>",
+    "ok <<call noop ( ) >> done",
+    "<<call noop (x)>>",
+    "<<call create_calendar_event()>>",
     "<<call create_calendar_event {\"start\":\"s\"}>>",
     "<<call create_calendar_event {\"title\":\"t\",\"start\":\"s\",\"n\":\"3\"}>>",
     "<<call create_calendar_event {\"title\":\"t\",\"start\":\"s\"}>",

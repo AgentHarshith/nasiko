@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! output   = *( text / call )
-//! call     = "<<call" WS1 toolname *WSP json-object *WSP ">>"
+//! call     = "<<call" WS1 toolname *WSP ( json-object / "(" *WSP ")" ) *WSP ">>"
+//!          / "<<call" WS1 toolname *WSP ">>"          ; the last two spellings mean `{}`
 //! toolname = 1*64( ALPHA / DIGIT / "_" / "." / "-" )
 //! text     = anything; "<<" not followed by "call" and whitespace is text
 //! ```
@@ -37,6 +38,8 @@ enum State {
     AfterMarker,
     Name,
     AfterName,
+    /// `(` seen after the name: only whitespace and `)` may follow. Equivalent to `{}`.
+    EmptyParens,
     Json,
     Close,
     Close2,
@@ -162,13 +165,9 @@ impl StreamDecoder {
                     self.name.push(c);
                 } else if c.is_whitespace() && self.name.is_empty() {
                     // Extra whitespace between the marker and the name.
-                } else if c.is_whitespace() || c == '{' {
+                } else if c.is_whitespace() || c == '{' || c == '(' || c == '>' {
                     self.lookup_name()?;
-                    if c == '{' {
-                        self.begin_json();
-                    } else {
-                        self.state = State::AfterName;
-                    }
+                    self.after_name(c);
                 } else {
                     return Err(ToolCompactError::malformed(format!(
                         "unexpected {c:?} in tool name"
@@ -176,11 +175,21 @@ impl StreamDecoder {
                 }
             }
             State::AfterName => {
-                if c == '{' {
-                    self.begin_json();
+                if c == '{' || c == '(' || c == '>' {
+                    self.after_name(c);
                 } else if !c.is_whitespace() {
                     return Err(ToolCompactError::malformed(
                         "expected '{' after the tool name",
+                    ));
+                }
+            }
+            State::EmptyParens => {
+                if c == ')' {
+                    self.empty_args();
+                    self.state = State::Close;
+                } else if !c.is_whitespace() {
+                    return Err(ToolCompactError::malformed(
+                        "expected ')' after '(': arguments go in a JSON object",
                     ));
                 }
             }
@@ -239,6 +248,29 @@ impl StreamDecoder {
             });
         }
         Ok(())
+    }
+
+    /// The character that ends the tool name decides how the arguments are spelled: `{` opens
+    /// the JSON object, `(` opens the empty-parentheses spelling, `>` is the first half of a
+    /// closing `>>` with no arguments at all, and whitespace defers the decision.
+    fn after_name(&mut self, c: char) {
+        match c {
+            '{' => self.begin_json(),
+            '(' => self.state = State::EmptyParens,
+            '>' => {
+                self.empty_args();
+                self.state = State::Close2;
+            }
+            _ => self.state = State::AfterName,
+        }
+    }
+
+    /// `<<call name>>` and `<<call name()>>` mean `<<call name {}>>`: the arguments are the
+    /// empty object, which `complete` still validates against the schema (a tool with required
+    /// arguments rejects it as `invalid_arguments`).
+    fn empty_args(&mut self) {
+        self.args.clear();
+        self.args.push_str("{}");
     }
 
     fn begin_json(&mut self) {

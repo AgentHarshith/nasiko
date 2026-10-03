@@ -877,6 +877,38 @@
    "expected": {
     "error": "unsupported_schema"
    }
+  },
+  {
+   "id": "ddc-017",
+   "note": "no-argument tool called the way models copy its signature line; equals {}",
+   "tools": [
+    "get_time"
+   ],
+   "chunks": [
+    "<<call get_ti",
+    "me()>>"
+   ],
+   "expected": {
+    "calls": [
+     {
+      "name": "get_time",
+      "arguments": {}
+     }
+    ]
+   }
+  },
+  {
+   "id": "ddc-018",
+   "note": "the empty-argument spellings are still validated: required arguments missing",
+   "tools": [
+    "get_weather"
+   ],
+   "chunks": [
+    "<<call get_weather>>"
+   ],
+   "expected": {
+    "error": "invalid_arguments"
+   }
   }
  ]
 }
