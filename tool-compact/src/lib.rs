@@ -59,7 +59,7 @@ mod validate;
 pub use call::{encode_call, validate_call};
 pub use encode::{decode_tools, encode_tools};
 pub use error::{Result, ToolCompactError};
-pub use instructions::INSTRUCTIONS;
+pub use instructions::{HEADER, INSTRUCTIONS};
 pub use json::canonical_json;
 pub use stream::{StreamDecoder, decode_calls};
 pub use types::{CompactTool, CompactTools, Decoded, ToolCall, ToolDef};

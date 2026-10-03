@@ -9,7 +9,7 @@
 use serde_json::Value;
 
 use crate::json::canonical_json;
-use crate::lexeme::{alias_for_format, is_bare_word, is_raw_safe, quote};
+use crate::lexeme::{alias_for_format, is_bare_word, is_raw_safe, quote, quote_description};
 use crate::schema::{Annot, Kind, Node, ObjectSchema, Scalar, ScalarBase};
 use crate::types::ToolDef;
 
@@ -22,7 +22,7 @@ pub(crate) fn render_tool(def: &ToolDef, schema: Option<&Node>) -> String {
         render_annot(&mut out, &node.annot);
         if let Some(d) = &node.description {
             out.push(' ');
-            out.push_str(&quote(d));
+            out.push_str(&quote_description(d));
         }
     }
     if let Some(d) = &def.description {
@@ -128,7 +128,7 @@ fn render_typed(out: &mut String, node: &Node) {
     render_annot(out, &node.annot);
     if let Some(d) = &node.description {
         out.push(' ');
-        out.push_str(&quote(d));
+        out.push_str(&quote_description(d));
     }
 }
 

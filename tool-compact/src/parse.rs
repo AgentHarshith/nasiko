@@ -57,9 +57,9 @@ fn parse_root(c: &mut Cursor<'_>) -> Result<Node, ParseError> {
         Kind::Object(parse_flags(c, body))
     };
     let annot = parse_annot(c)?;
-    let description = if c.starts_with(" \"") {
+    let description = if c.starts_with(" \"") || c.starts_with(" '") {
         c.expect(" ")?;
-        Some(c.take_json_string()?)
+        Some(c.take_description()?)
     } else {
         None
     };
@@ -178,9 +178,9 @@ fn parse_annot(c: &mut Cursor<'_>) -> Result<Annot, ParseError> {
 fn parse_typed(c: &mut Cursor<'_>) -> Result<Node, ParseError> {
     let mut node = parse_type(c)?;
     node.annot = parse_annot(c)?;
-    if c.starts_with(" \"") {
+    if c.starts_with(" \"") || c.starts_with(" '") {
         c.expect(" ")?;
-        node.description = Some(c.take_json_string()?);
+        node.description = Some(c.take_description()?);
     }
     Ok(node)
 }

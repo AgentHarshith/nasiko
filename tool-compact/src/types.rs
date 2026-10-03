@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::instructions::INSTRUCTIONS;
+use crate::instructions::{HEADER, INSTRUCTIONS};
 
 /// One function tool as the caller sees it: the OpenAI `function` object without the wrapper.
 ///
@@ -44,9 +44,14 @@ impl CompactTools {
         &self.definitions
     }
 
-    /// The fixed call-format instructions ([`INSTRUCTIONS`]).
+    /// The fixed call-format instructions ([`INSTRUCTIONS`]), placed after the definitions.
     pub fn instructions(&self) -> &'static str {
         INSTRUCTIONS
+    }
+
+    /// The fixed header line ([`HEADER`]), placed before the definitions.
+    pub fn header(&self) -> &'static str {
+        HEADER
     }
 
     /// Per-tool lines in input order.
@@ -54,12 +59,16 @@ impl CompactTools {
         &self.tools
     }
 
-    /// Instructions followed by the definitions: the text a caller puts in a system message.
+    /// Header, definitions, then the call instructions: the text a caller puts in a system
+    /// message.
     pub fn prompt(&self) -> String {
-        let mut out = String::with_capacity(INSTRUCTIONS.len() + 1 + self.definitions.len());
-        out.push_str(INSTRUCTIONS);
+        let mut out =
+            String::with_capacity(HEADER.len() + INSTRUCTIONS.len() + 2 + self.definitions.len());
+        out.push_str(HEADER);
         out.push('\n');
         out.push_str(&self.definitions);
+        out.push('\n');
+        out.push_str(INSTRUCTIONS);
         out
     }
 }

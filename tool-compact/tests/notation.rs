@@ -7,7 +7,7 @@
 mod common;
 
 use common::tool;
-use nasiko_tool_compact::{INSTRUCTIONS, ToolDef, encode_tools};
+use nasiko_tool_compact::{HEADER, INSTRUCTIONS, ToolDef, encode_tools};
 use serde_json::{Value, json};
 
 fn line(parameters: Value) -> String {
@@ -76,7 +76,7 @@ fn descriptions_are_quoted_on_properties_and_raw_or_quoted_on_tools() {
         }])
         .unwrap()
         .definitions(),
-        "t(a?:str \"Event title\") \"root \\\"d\\\"\" - Plain. Has \"quotes\" too"
+        "t(a?:str 'Event title') 'root \"d\"' - Plain. Has \"quotes\" too"
     );
     for (desc, expected) in [
         ("two\nlines", "t - \"two\\nlines\""),
@@ -107,16 +107,18 @@ fn reserved_words_and_digit_strings_are_quoted_in_enums() {
 }
 
 #[test]
-fn the_prompt_is_instructions_newline_definitions() {
+fn the_prompt_is_header_definitions_then_instructions() {
     let compact = encode_tools(&[tool("t", json!({"type": "object"}))]).unwrap();
     assert_eq!(compact.instructions(), INSTRUCTIONS);
+    assert_eq!(compact.header(), HEADER);
     assert_eq!(
         compact.prompt(),
-        format!("{INSTRUCTIONS}\nt(...) - test tool")
+        format!("{HEADER}\nt(...) - test tool\n{INSTRUCTIONS}")
     );
     assert!(INSTRUCTIONS.contains("<<call tool_name {\"arg\": \"value\"}>>"));
     assert!(
-        !INSTRUCTIONS.to_lowercase().contains("validat"),
+        !INSTRUCTIONS.to_lowercase().contains("validat")
+            && !HEADER.to_lowercase().contains("validat"),
         "format aliases must not be advertised as validation"
     );
 }

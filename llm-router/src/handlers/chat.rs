@@ -1620,11 +1620,24 @@ mod tests {
         }})
     }
 
+    fn forecast_tool() -> Value {
+        json!({"type": "function", "function": {
+            "name": "get_forecast",
+            "description": "Five-day forecast for a city",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string", "description": "City name"},
+                "days": {"type": "integer", "minimum": 1, "maximum": 5, "description": "Number of days"}
+            }, "required": ["city"]}
+        }})
+    }
+
+    /// Two tools: enough for the compact message to be smaller than the tools JSON. A single
+    /// small tool is correctly left native (`no_byte_saving`), which the bypass test covers.
     fn tools_request() -> Value {
         json!({
             "model": "gpt-4o",
             "messages": [{"role": "user", "content": "Weather in Paris?"}],
-            "tools": [weather_tool()],
+            "tools": [weather_tool(), forecast_tool()],
             "tool_choice": "auto"
         })
     }
@@ -1742,8 +1755,11 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
         let catalog = messages[0]["content"].as_str().unwrap();
-        assert!(catalog.starts_with(nasiko_tool_compact::INSTRUCTIONS));
-        assert!(catalog.ends_with("get_weather(city:str, unit?:c|f) - Current weather for a city"));
+        assert!(catalog.starts_with(nasiko_tool_compact::HEADER));
+        assert!(
+            catalog.contains("\nget_weather(city:str, unit?:c|f) - Current weather for a city\n")
+        );
+        assert!(catalog.ends_with(nasiko_tool_compact::INSTRUCTIONS));
         assert_eq!(
             messages[1],
             json!({"role": "user", "content": "Weather in Paris?"})
@@ -1867,6 +1883,13 @@ mod tests {
                         json!("^[A-Z]")
                 }),
             ),
+            (
+                "single tiny tool: compact message would not be smaller",
+                with(|r| {
+                    r["tools"] = json!([{"type": "function", "function": {
+                        "name": "ping", "parameters": {"type": "object"}}}])
+                }),
+            ),
         ];
         let upstream = call_reply("plain text, no call");
         for (label, request) in cases {
@@ -1902,7 +1925,7 @@ mod tests {
         let mock = server
             .mock("POST", "/chat/completions")
             .match_body(mockito::Matcher::PartialJson(
-                json!({"stream": true, "tools": [weather_tool()]}),
+                json!({"stream": true, "tools": [weather_tool(), forecast_tool()]}),
             ))
             .with_status(200)
             .with_header("content-type", "text/event-stream")

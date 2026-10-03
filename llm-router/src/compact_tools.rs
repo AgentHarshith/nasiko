@@ -47,6 +47,9 @@ pub enum Bypass {
     UnsupportedSchema,
     InvalidCatalog,
     LimitExceeded,
+    /// The compact message is not enough smaller (in bytes) than the `tools` JSON it replaces
+    /// to be worth changing the protocol. See [`MIN_SAVING_RATIO`].
+    NoByteSaving,
 }
 
 impl Bypass {
@@ -67,9 +70,20 @@ impl Bypass {
             Self::UnsupportedSchema => "unsupported_schema",
             Self::InvalidCatalog => "invalid_catalog",
             Self::LimitExceeded => "limit_exceeded",
+            Self::NoByteSaving => "no_byte_saving",
         }
     }
 }
+
+/// A request is compacted only when the compact message is at most this fraction of the native
+/// `tools` JSON, in bytes: `compact_bytes * DEN <= native_bytes * NUM`.
+///
+/// Bytes are the only size available without a tokenizer in the request path. Measured with
+/// `o200k_base` over the shipped fixtures (`examples/compact_tools_measure.rs`), token break-even
+/// sits near a byte ratio of 0.78–0.80: the compact text lives inside a JSON string where every
+/// `"` costs an escape, and the fixed framing weighs most on one- or two-tool catalogs. Three
+/// quarters keeps every measured case at or above zero saving.
+pub const MIN_SAVING_RATIO: (usize, usize) = (3, 4);
 
 /// What only the un-parsed body can tell us. `FunctionDef` has no catch-all map, so a key such
 /// as `strict` inside `tools[i].function` is gone once the body has been parsed into the IR; the
@@ -200,9 +214,14 @@ pub fn plan(req: &ChatRequest, raw: &RawFacts, format: InboundFormat, cfg: &Gate
         }
     };
     let system_message = compact.prompt();
+    let definitions_bytes_in = serde_json::to_string(tools).map(|s| s.len()).unwrap_or(0);
+    let (num, den) = MIN_SAVING_RATIO;
+    if system_message.len().saturating_mul(den) > definitions_bytes_in.saturating_mul(num) {
+        return Plan::Bypass(Bypass::NoByteSaving);
+    }
     Plan::Apply(Compiled {
         tool_count: defs.len(),
-        definitions_bytes_in: serde_json::to_string(tools).map(|s| s.len()).unwrap_or(0),
+        definitions_bytes_in,
         definitions_bytes_out: system_message.len(),
         system_message,
         tools: defs,
@@ -475,6 +494,16 @@ mod tests {
         )
     }
 
+    fn forecast() -> ToolDef {
+        tool(
+            "get_forecast",
+            json!({"type": "object", "properties": {
+                "city": {"type": "string", "description": "City name"},
+                "days": {"type": "integer", "minimum": 1, "maximum": 5, "description": "Number of days"}
+            }, "required": ["city"]}),
+        )
+    }
+
     fn request(tools: Vec<ToolDef>) -> ChatRequest {
         serde_json::from_value(json!({
             "model": "gpt-4o",
@@ -501,7 +530,7 @@ mod tests {
     }
 
     fn compiled() -> Compiled {
-        match plan_for(&request(vec![weather()])) {
+        match plan_for(&request(vec![weather(), forecast()])) {
             Plan::Apply(c) => c,
             Plan::Bypass(b) => panic!("unexpected bypass {b:?}"),
         }
@@ -509,7 +538,7 @@ mod tests {
 
     #[test]
     fn plan_bypasses_in_the_documented_order() {
-        let base = request(vec![weather()]);
+        let base = request(vec![weather(), forecast()]);
         assert_eq!(
             plan(
                 &base,
@@ -615,6 +644,11 @@ mod tests {
         );
         let dup = request(vec![weather(), weather()]);
         assert_eq!(plan_for(&dup).bypass(), Some(Bypass::InvalidCatalog));
+        // A catalog so small that the framing outweighs the saving stays native.
+        let tiny = request(vec![tool("ping", json!({"type": "object"}))]);
+        assert_eq!(plan_for(&tiny).bypass(), Some(Bypass::NoByteSaving));
+        let single = request(vec![weather()]);
+        assert_eq!(plan_for(&single).bypass(), Some(Bypass::NoByteSaving));
     }
 
     #[test]
@@ -637,7 +671,7 @@ mod tests {
 
     #[test]
     fn apply_inserts_one_system_message_after_the_leading_system_run_and_changes_nothing_else() {
-        let mut req = request(vec![weather()]);
+        let mut req = request(vec![weather(), forecast()]);
         req.extra.insert("parallel_tool_calls".into(), json!(true));
         req.extra.insert("top_p".into(), json!(0.5));
         let before = serde_json::to_value(&req).unwrap();
@@ -663,18 +697,23 @@ mod tests {
         assert!(
             compiled
                 .system_message
-                .starts_with(nasiko_tool_compact::INSTRUCTIONS)
+                .starts_with(nasiko_tool_compact::HEADER)
+        );
+        assert!(
+            compiled
+                .system_message
+                .ends_with(nasiko_tool_compact::INSTRUCTIONS)
         );
 
         // No system messages: the catalog goes first. Two leading plus a later one: after the two.
-        let mut req: ChatRequest = serde_json::from_value(json!({"messages": [{"role": "user", "content": "x"}], "tools": [serde_json::to_value(weather()).unwrap()]})).unwrap();
+        let mut req: ChatRequest = serde_json::from_value(json!({"messages": [{"role": "user", "content": "x"}], "tools": [serde_json::to_value(weather()).unwrap(), serde_json::to_value(forecast()).unwrap()]})).unwrap();
         apply(&mut req, &compiled);
         assert_eq!(req.messages[0].role, "system");
         assert_eq!(req.messages[1].role, "user");
         let mut req: ChatRequest = serde_json::from_value(json!({"messages": [
             {"role": "system", "content": "a"}, {"role": "system", "content": "b"},
             {"role": "user", "content": "x"}, {"role": "system", "content": "late"}
-        ], "tools": [serde_json::to_value(weather()).unwrap()]}))
+        ], "tools": [serde_json::to_value(weather()).unwrap(), serde_json::to_value(forecast()).unwrap()]}))
         .unwrap();
         apply(&mut req, &compiled);
         assert_eq!(
@@ -887,7 +926,7 @@ mod tests {
         let plan = Plan::Apply(compiled.clone());
         let pending = to_metadata(&plan, None).unwrap();
         assert_eq!(pending["applied"], json!(true));
-        assert_eq!(pending["tool_count"], json!(1));
+        assert_eq!(pending["tool_count"], json!(2));
         assert!(
             pending["definitions_bytes_in"].as_u64().unwrap()
                 > pending["definitions_bytes_out"].as_u64().unwrap() / 4

@@ -72,6 +72,18 @@ pub(crate) fn quote(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| String::from("\"\""))
 }
 
+/// Property and root-schema descriptions sit between delimiters, so they are always quoted.
+/// Single quotes are preferred: the compact text travels inside a JSON string, where every `"`
+/// costs an escape. A description that contains `'`, `\` or a control character falls back to
+/// the JSON form, so the two forms partition the strings and parsing is unambiguous.
+pub(crate) fn quote_description(s: &str) -> String {
+    if !s.is_empty() && !s.contains('\'') && !s.contains('\\') && !s.chars().any(char::is_control) {
+        format!("'{s}'")
+    } else {
+        quote(s)
+    }
+}
+
 /// A tool description can stay raw when it contains no control characters, no surrounding
 /// whitespace and does not start with a quote (the parser dispatches on the first character).
 pub(crate) fn is_raw_safe(s: &str) -> bool {
@@ -222,6 +234,25 @@ impl<'a> Cursor<'a> {
         Ok(value)
     }
 
+    /// Parse a description: `'…'` (no escapes by construction) or a JSON string.
+    pub(crate) fn take_description(&mut self) -> Result<String, ParseError> {
+        if self.starts_with("'") {
+            let rest = self.rest();
+            let inner = rest.get(1..).unwrap_or("");
+            let Some(end) = inner.find('\'') else {
+                return Err(self.err("unterminated description"));
+            };
+            let text = inner.get(..end).unwrap_or("").to_owned();
+            if text.is_empty() {
+                return Err(self.err("single-quoted descriptions are never empty"));
+            }
+            self.pos += end + 2;
+            Ok(text)
+        } else {
+            self.take_json_string()
+        }
+    }
+
     /// Parse a JSON number token with `serde_json`'s number grammar.
     pub(crate) fn take_number(&mut self) -> Result<Number, ParseError> {
         let start = self.pos;
@@ -282,6 +313,26 @@ mod tests {
         assert!(!is_bare_word("str"));
         assert!(!is_bare_word("2"));
         assert!(!is_bare_word("zh-Hans ok"));
+    }
+
+    #[test]
+    fn descriptions_prefer_single_quotes_and_fall_back_to_json_exactly_when_needed() {
+        for (input, expected) in [
+            ("Event title", "'Event title'"),
+            ("has \"double\" quotes", "'has \"double\" quotes'"),
+            ("it's", "\"it's\""),
+            ("back\\slash", "\"back\\\\slash\""),
+            ("two\nlines", "\"two\\nlines\""),
+            ("", "\"\""),
+            ("日本語 🎉", "'日本語 🎉'"),
+        ] {
+            let rendered = quote_description(input);
+            assert_eq!(rendered, expected, "{input:?}");
+            let mut c = Cursor::new(&rendered);
+            assert_eq!(c.take_description().unwrap(), input, "{input:?}");
+            assert!(c.at_end());
+        }
+        assert!(Cursor::new("'open").take_description().is_err());
     }
 
     #[test]
