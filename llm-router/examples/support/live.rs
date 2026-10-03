@@ -162,10 +162,29 @@ pub async fn call_live(http: &reqwest::Client, cfg: &LiveConfig, body: &Value) -
             Err(e) => {
                 return LiveOutcome::Failed {
                     status: None,
-                    message: sanitize_message(&e.to_string(), cfg.api_key.as_deref()),
+                    message: sanitize_message(
+                        &transport_message(&e, cfg.timeout),
+                        cfg.api_key.as_deref(),
+                    ),
                 };
             }
         }
+    }
+}
+
+/// Name the transport failure precisely: reqwest's `Display` says only "error sending request",
+/// which hides the one distinction a reader needs (the model exceeded our timeout versus the
+/// endpoint being unreachable).
+fn transport_message(e: &reqwest::Error, timeout: Duration) -> String {
+    if e.is_timeout() {
+        format!(
+            "timeout after {}s with no complete response",
+            timeout.as_secs()
+        )
+    } else if e.is_connect() {
+        format!("connection failed: {e}")
+    } else {
+        e.to_string()
     }
 }
 
@@ -440,6 +459,44 @@ mod tests {
                 message: "no".into()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn a_slow_endpoint_is_reported_as_a_timeout_not_a_generic_send_error() {
+        let b = built(true);
+        let mut server = mockito::Server::new_async().await;
+        let _slow = server
+            .mock("POST", "/chat/completions")
+            .with_status(200)
+            .with_body_from_request(|_| {
+                std::thread::sleep(Duration::from_millis(1500));
+                b"{}".to_vec()
+            })
+            .create_async()
+            .await;
+        let http = live_client(Duration::from_millis(300)).unwrap();
+        let mut c = cfg(&server.url(), None);
+        c.timeout = Duration::from_millis(300);
+        match call_live(&http, &c, &b.body).await {
+            LiveOutcome::Failed {
+                status: None,
+                message,
+            } => {
+                assert!(message.starts_with("timeout after 0s"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let http = live_client(Duration::from_secs(2)).unwrap();
+        let unreachable = cfg("http://127.0.0.1:9", None);
+        match call_live(&http, &unreachable, &b.body).await {
+            LiveOutcome::Failed {
+                status: None,
+                message,
+            } => {
+                assert!(message.starts_with("connection failed"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
