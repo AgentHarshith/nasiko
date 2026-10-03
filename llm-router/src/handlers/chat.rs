@@ -300,7 +300,13 @@ async fn chat_core(
     // and before `sent_bytes`, so the inserted catalog counts as text actually sent. Off by
     // default; `plan` records exactly why a request was left native. The fallback executor
     // clones `req` per attempt, so every attempt sees the same compacted request.
-    let compact_plan = crate::compact_tools::plan(&req, &raw_facts, format, &ctx.cfg);
+    let compact_plan = crate::compact_tools::plan(
+        &req,
+        &raw_facts,
+        format,
+        &ctx.cfg,
+        resolved.compact_tools_enabled,
+    );
     let compiled = match &compact_plan {
         crate::compact_tools::Plan::Apply(c) => {
             crate::compact_tools::apply(&mut req, c);
@@ -940,6 +946,7 @@ mod tests {
         config: Option<LLMConfig>,
         is_coding_agent: bool,
         compress_enabled: bool,
+        compact_tools_enabled: bool,
     }
     #[async_trait]
     impl RegistryStore for Store {
@@ -952,6 +959,7 @@ mod tests {
                 agent_pinned_model: None,
                 is_coding_agent: self.is_coding_agent,
                 compress_enabled: self.compress_enabled,
+                compact_tools_enabled: self.compact_tools_enabled,
             }))
         }
         async fn fetch_user_secret(&self, _: Uuid, _: &str) -> Result<Option<String>, sqlx::Error> {
@@ -1121,6 +1129,7 @@ mod tests {
             config: None,
             is_coding_agent: false,
             compress_enabled,
+            compact_tools_enabled: false,
         };
         chat_core(
             &ctx,
@@ -1219,6 +1228,7 @@ mod tests {
             config: None,
             is_coding_agent: false,
             compress_enabled: false,
+            compact_tools_enabled: false,
         };
         let body = json!({ "model": "gpt-4o", "messages": [{ "role": "user", "content": "hi" }] });
         let resp = chat_core(
@@ -1265,6 +1275,7 @@ mod tests {
             config: Some(openai_config()),
             is_coding_agent: false,
             compress_enabled: false,
+            compact_tools_enabled: false,
         };
         // Anthropic Messages request shape: top-level system + max_tokens.
         let body = json!({
@@ -1321,6 +1332,7 @@ mod tests {
             config: Some(openai_config()),
             is_coding_agent: false,
             compress_enabled: false,
+            compact_tools_enabled: false,
         };
         // Gemini Messages request shape: systemInstruction + contents.
         let body = json!({
@@ -1367,6 +1379,7 @@ mod tests {
             config: None,
             is_coding_agent: false,
             compress_enabled: false,
+            compact_tools_enabled: false,
         };
         let body = json!({ "model": "gpt-4o", "stream": true, "messages": [{ "role": "user", "content": "hi" }] });
         let resp = chat_core(
@@ -1398,6 +1411,7 @@ mod tests {
             config: None,
             is_coding_agent: false,
             compress_enabled: false,
+            compact_tools_enabled: false,
         };
         let body = json!({ "model": "gpt-4o", "messages": [] });
         let err = chat_core(
@@ -1437,6 +1451,7 @@ mod tests {
             config: None,
             is_coding_agent: false,
             compress_enabled: false,
+            compact_tools_enabled: false,
         };
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1467,6 +1482,7 @@ mod tests {
         ctx.tier_registry = Arc::new(crate::routing::registry::test_support::StubRegistry);
         let store = Store {
             compress_enabled: false,
+            compact_tools_enabled: false,
             // A configured model that is NOT one of openai's seeded tier models
             // (gpt-5.5 / gpt-5.4 / gpt-4o-mini) — if the classifier never fires, the
             // resolved model will be exactly this. If it does fire, it will be one of the
@@ -1531,6 +1547,7 @@ mod tests {
             }),
             is_coding_agent: false,
             compress_enabled: false,
+            compact_tools_enabled: false,
         };
         let result = resolve_routed_request(
             &ctx,
@@ -1577,6 +1594,7 @@ mod tests {
             }),
             is_coding_agent: false,
             compress_enabled: false,
+            compact_tools_enabled: false,
         };
         let body = json!({ "model": "gpt-4o", "messages": [{ "role": "user", "content": "hi" }] });
         let err = chat_core(
@@ -1700,11 +1718,13 @@ mod tests {
         (sent, result)
     }
 
+    /// An agent that has opted in: `agents.compact_tools_enabled` is on.
     fn plain_store() -> Store {
         Store {
             config: None,
             is_coding_agent: false,
             compress_enabled: false,
+            compact_tools_enabled: true,
         }
     }
 
@@ -1918,6 +1938,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_agent_that_has_not_opted_in_keeps_the_native_request() {
+        let store = Store {
+            config: None,
+            is_coding_agent: false,
+            compress_enabled: false,
+            compact_tools_enabled: false,
+        };
+        let upstream = call_reply("plain text");
+        let (sent, result) = exchange(
+            true,
+            &store,
+            InboundFormat::OpenAi,
+            tools_request(),
+            upstream.clone(),
+        )
+        .await;
+        assert!(sent["tools"].is_array(), "{sent}");
+        assert_eq!(sent["messages"], tools_request()["messages"]);
+        assert_eq!(result.unwrap(), upstream);
+    }
+
+    #[tokio::test]
     async fn streaming_and_non_openai_inbound_bypass_too() {
         // Streaming: the provider still receives `tools` and the SSE path is untouched.
         let mut server = mockito::Server::new_async().await;
@@ -1958,6 +2000,7 @@ mod tests {
             config: Some(openai_config()),
             is_coding_agent: false,
             compress_enabled: false,
+            compact_tools_enabled: false,
         };
         let (sent, result) = exchange(
             true,
@@ -2168,6 +2211,7 @@ mod tests {
             config: None,
             is_coding_agent: false,
             compress_enabled: true,
+            compact_tools_enabled: true,
         };
         let mut request = tools_request();
         request["messages"] = json!([
@@ -2245,6 +2289,7 @@ mod tests {
             }),
             is_coding_agent: false,
             compress_enabled: false,
+            compact_tools_enabled: true,
         };
         let ctx = compact_ctx(server.url(), true);
         let resp = chat_core(
@@ -2297,6 +2342,7 @@ mod tests {
                 agent_pinned_model: None,
                 is_coding_agent: false,
                 compress_enabled: false,
+                compact_tools_enabled: true,
             }))
         }
         async fn fetch_user_secret(&self, _: Uuid, _: &str) -> Result<Option<String>, sqlx::Error> {

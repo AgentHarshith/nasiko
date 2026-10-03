@@ -33,6 +33,9 @@ use crate::ir::{ChatRequest, ChatResponse, FunctionCall, Message, ToolCall};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bypass {
     FeatureDisabled,
+    /// The operator enabled the feature, but this agent has not opted in
+    /// (`agents.compact_tools_enabled`).
+    AgentOptedOut,
     NonOpenAiInbound,
     Streaming,
     NoTools,
@@ -56,6 +59,7 @@ impl Bypass {
     pub const fn as_label(self) -> &'static str {
         match self {
             Self::FeatureDisabled => "feature_disabled",
+            Self::AgentOptedOut => "agent_opted_out",
             Self::NonOpenAiInbound => "non_openai_inbound",
             Self::Streaming => "streaming",
             Self::NoTools => "no_tools",
@@ -150,10 +154,21 @@ impl Plan {
 }
 
 /// Decide whether this request is compacted. Checks run in a fixed order; the first refusal is
-/// the recorded label.
-pub fn plan(req: &ChatRequest, raw: &RawFacts, format: InboundFormat, cfg: &GatewayConfig) -> Plan {
+/// the recorded label. `consent` is the agent's own opt-in
+/// (`ResolvedConfig::compact_tools_enabled`); the fleet flag in `cfg` is the operator's gate and
+/// is checked first, so an unconfigured deployment records nothing at all.
+pub fn plan(
+    req: &ChatRequest,
+    raw: &RawFacts,
+    format: InboundFormat,
+    cfg: &GatewayConfig,
+    consent: bool,
+) -> Plan {
     if !cfg.compact_tools_enabled {
         return Plan::Bypass(Bypass::FeatureDisabled);
+    }
+    if !consent {
+        return Plan::Bypass(Bypass::AgentOptedOut);
     }
     if format != InboundFormat::OpenAi {
         return Plan::Bypass(Bypass::NonOpenAiInbound);
@@ -228,14 +243,15 @@ pub fn plan(req: &ChatRequest, raw: &RawFacts, format: InboundFormat, cfg: &Gate
     })
 }
 
-/// [`plan`] for callers that still own the raw body (the evaluation example, tests).
+/// [`plan`] for callers that still own the raw body (the evaluation example, tests). Such
+/// callers stand in for an agent that has opted in.
 pub fn plan_from_body(
     req: &ChatRequest,
     body: &Value,
     format: InboundFormat,
     cfg: &GatewayConfig,
 ) -> Plan {
-    plan(req, &inspect_raw(body), format, cfg)
+    plan(req, &inspect_raw(body), format, cfg, true)
 }
 
 /// Rewrite the outbound request. Only `tools`, `tool_choice`, `parallel_tool_calls` and the
@@ -515,7 +531,13 @@ mod tests {
     }
 
     fn plan_for(req: &ChatRequest) -> Plan {
-        plan(req, &RawFacts::default(), InboundFormat::OpenAi, &cfg(true))
+        plan(
+            req,
+            &RawFacts::default(),
+            InboundFormat::OpenAi,
+            &cfg(true),
+            true,
+        )
     }
 
     fn response(content: Value, finish: Option<&str>, tool_calls: Option<Value>) -> ChatResponse {
@@ -542,7 +564,21 @@ mod tests {
                 &base,
                 &RawFacts::default(),
                 InboundFormat::OpenAi,
-                &cfg(false)
+                &cfg(false),
+                true
+            )
+            .bypass(),
+            Some(Bypass::FeatureDisabled)
+        );
+        // The operator's gate comes first: with the fleet flag off nothing is recorded, whatever
+        // the agent chose. With it on, an agent that has not opted in is a labelled bypass.
+        assert_eq!(
+            plan(
+                &base,
+                &RawFacts::default(),
+                InboundFormat::OpenAi,
+                &cfg(false),
+                false
             )
             .bypass(),
             Some(Bypass::FeatureDisabled)
@@ -551,8 +587,20 @@ mod tests {
             plan(
                 &base,
                 &RawFacts::default(),
+                InboundFormat::OpenAi,
+                &cfg(true),
+                false
+            )
+            .bypass(),
+            Some(Bypass::AgentOptedOut)
+        );
+        assert_eq!(
+            plan(
+                &base,
+                &RawFacts::default(),
                 InboundFormat::Anthropic,
-                &cfg(true)
+                &cfg(true),
+                true
             )
             .bypass(),
             Some(Bypass::NonOpenAiInbound)
@@ -611,7 +659,7 @@ mod tests {
             function_has_extra_keys: true,
         };
         assert_eq!(
-            plan(&base, &raw, InboundFormat::OpenAi, &cfg(true)).bypass(),
+            plan(&base, &raw, InboundFormat::OpenAi, &cfg(true), true).bypass(),
             Some(Bypass::StrictOrUnknownToolKeys)
         );
         let mut r = base.clone();
