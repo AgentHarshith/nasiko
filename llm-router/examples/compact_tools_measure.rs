@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 use support::eval::{self, BuiltRequest, CaseInputs, EvalSet};
 use support::live::{self, LiveConfig, LiveOutcome};
-use support::measure::{self, CaseMeasurement, Report, TokenCounter};
+use support::measure::{self, CaseMeasurement, Report, TokenCounter, VariantLive};
 
 struct Tiktoken(tiktoken_rs::CoreBPE);
 
@@ -108,7 +108,6 @@ async fn main() {
             };
             if let Some(cfg) = &live_cfg
                 && m.bypass.is_none()
-                && !auth_failed
             {
                 let inputs = CaseInputs {
                     tools: &case.tools,
@@ -149,6 +148,11 @@ async fn main() {
                 .map(|(name, body, built)| (name, body.expect("filtered"), built))
                 .collect();
                 for (variant, body, built) in bodies {
+                    if auth_failed {
+                        // Reported as skipped, never as a failure of the model or the format.
+                        measure::record_live(&mut m, variant, VariantLive::Skipped);
+                        continue;
+                    }
                     match live::call_live(&http, cfg, body).await {
                         LiveOutcome::Completed(reply) => {
                             let judged = live::judge_reply(&reply, built);
@@ -161,21 +165,17 @@ async fn main() {
                             measure::record_live(
                                 &mut m,
                                 variant,
-                                result,
-                                &case.expected,
-                                case.match_rules.as_ref(),
+                                measure::verdict(result, &case.expected, case.match_rules.as_ref()),
                             );
                         }
                         LiveOutcome::Failed { status, message } => {
                             measure::record_live(
                                 &mut m,
                                 variant,
-                                Err(format!(
+                                VariantLive::TransportError(format!(
                                     "http {}: {message}",
                                     status.map_or("none".to_owned(), |s| s.to_string())
                                 )),
-                                &case.expected,
-                                None,
                             );
                         }
                         LiveOutcome::AuthFailed { status, message } => {
@@ -186,11 +186,8 @@ async fn main() {
                             measure::record_live(
                                 &mut m,
                                 variant,
-                                Err(format!("auth {status}")),
-                                &case.expected,
-                                None,
+                                VariantLive::TransportError(format!("auth {status}")),
                             );
-                            break;
                         }
                     }
                 }

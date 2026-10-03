@@ -342,16 +342,14 @@ pub fn finalize(resp: &ChatResponse, compiled: &Compiled) -> Result<Finalized, D
             if finish != Some("tool_calls") {
                 return Err(DecodeFailure::new("incomplete_completion"));
             }
-            let mut calls = Vec::with_capacity(native_calls.len());
-            for call in native_calls {
-                let validated = nasiko_tool_compact::validate_call(
-                    &call.function.name,
-                    &call.function.arguments,
-                    &compiled.tools,
-                )
+            // The same limits the stream decoder enforces apply to a native batch, checked
+            // before any argument is parsed; any failure rejects the whole response.
+            let pairs: Vec<(&str, &str)> = native_calls
+                .iter()
+                .map(|c| (c.function.name.as_str(), c.function.arguments.as_str()))
+                .collect();
+            let calls = nasiko_tool_compact::validate_calls(&pairs, &compiled.tools)
                 .map_err(|e| DecodeFailure::new(e.kind()))?;
-                calls.push(validated);
-            }
             Ok(Finalized {
                 content: text,
                 calls,
@@ -877,6 +875,61 @@ mod tests {
         assert_eq!(
             finalize(&resp, &compiled).unwrap_err().kind,
             "malformed_call"
+        );
+    }
+
+    #[test]
+    fn native_batches_obey_the_decoder_limits_and_release_nothing_on_a_violation() {
+        use nasiko_tool_compact::limits;
+        let compiled = compiled();
+        let call = |args: String| json!({"id": "c", "type": "function", "function": {"name": "get_weather", "arguments": args}});
+        let small = || call("{\"city\":\"P\"}".into());
+
+        // Too many calls.
+        let many: Vec<Value> = (0..=limits::MAX_CALLS).map(|_| small()).collect();
+        let mut resp = response(Value::Null, Some("tool_calls"), Some(Value::Array(many)));
+        let before = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            restore(&mut resp, &compiled).unwrap_err().kind,
+            "limit_exceeded"
+        );
+        assert_eq!(serde_json::to_value(&resp).unwrap(), before);
+        let exact: Vec<Value> = (0..limits::MAX_CALLS).map(|_| small()).collect();
+        let resp = response(Value::Null, Some("tool_calls"), Some(Value::Array(exact)));
+        assert_eq!(
+            finalize(&resp, &compiled).unwrap().calls.len(),
+            limits::MAX_CALLS
+        );
+
+        // One oversized call, even after a valid one.
+        let oversized = call(format!(
+            "{{\"city\":\"{}\"}}",
+            "x".repeat(limits::MAX_ARGS_BYTES)
+        ));
+        let resp = response(
+            Value::Null,
+            Some("tool_calls"),
+            Some(json!([small(), oversized])),
+        );
+        let err = finalize(&resp, &compiled).unwrap_err();
+        assert_eq!(err.kind, "limit_exceeded");
+
+        // Aggregate argument bytes.
+        let chunk = call(format!("{{\"city\":\"{}\"}}", "x".repeat(200 * 1024)));
+        let resp = response(
+            Value::Null,
+            Some("tool_calls"),
+            Some(json!([chunk.clone(), chunk.clone()])),
+        );
+        assert_eq!(finalize(&resp, &compiled).unwrap().calls.len(), 2);
+        let resp = response(
+            Value::Null,
+            Some("tool_calls"),
+            Some(json!([chunk.clone(), chunk.clone(), chunk])),
+        );
+        assert_eq!(
+            finalize(&resp, &compiled).unwrap_err().kind,
+            "limit_exceeded"
         );
     }
 

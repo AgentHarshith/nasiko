@@ -107,7 +107,9 @@ After dispatch the reply is judged by its representation:
 
 - `<<call …>>` text needs `finish_reason: "stop"`; it is decoded and rebuilt natively.
 - Native `tool_calls` (a provider may still emit them) need `finish_reason: "tool_calls"` and are
-  validated against the original schemas; valid ones are kept as is.
+  validated against the original schemas under the decoder's limits (per-call size, call count,
+  aggregate size, all checked before parsing); valid ones are kept as is, any violation rejects
+  the whole reply.
 - Mixing both, more than one choice, a truncated/filtered/missing completion with executable
   output, an unknown tool, invalid or malformed arguments: **502**
   `{"detail":"compact tool call decoding failed: <kind>"}`. The body carries only the kind, never
@@ -139,6 +141,12 @@ EVAL_SET=… OUT=… cargo run --release -p nasiko-llm-router --example compact_
 OUT=/tmp/measure.md EVAL_SET=/tmp/compact-tools-eval.json \
 cargo run --release -p nasiko-llm-router --example compact_tools_measure
 ```
+
+In live mode a reply counts as judged only when it finished (`finish_reason` `stop` or
+`tool_calls`); a missing, truncated or filtered completion is reported as `incomplete_completion`
+even when it carries no call, which is stricter than the router's own passthrough. The measurement
+report's adherence rate is matched divided by every attempted case (matched, mismatched and output
+failures); transport errors and skipped cases are listed beside it, not inside it.
 
 Optional env: `MODEL` (also the offline request's `model`), `MAX_OUTPUT_TOKENS` (1024),
 `LIVE_TIMEOUT_SECS` (60), `BEDROCK_API_KEY` as an alias of `PROVIDER_API_KEY`, `FIXTURES_DIR`

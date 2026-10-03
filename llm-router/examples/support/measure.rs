@@ -136,11 +136,22 @@ pub fn build_variants(
     })
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct VariantLive {
-    /// `Some(true)` when the decoded calls matched the expected ones under the case's rules.
-    pub matched: Option<bool>,
-    pub error: Option<String>,
+/// What one live attempt of one variant produced. Only `Matched` counts as correct; the
+/// denominator of the adherence rate is every attempted case (matched, mismatched and output
+/// failures). Transport errors and skips are reported beside it, never folded into either number.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VariantLive {
+    /// The reply finished and the released calls equal the expected ones under the case's rules.
+    Matched,
+    /// The reply finished and released calls, but not the expected ones.
+    Mismatched,
+    /// The model's output could not be used: decoding, validation or an unfinished completion.
+    /// Carries the error kind.
+    OutputFailure(String),
+    /// The request never produced a reply to judge (HTTP or connection failure).
+    TransportError(String),
+    /// Not attempted (after an authentication failure stopped the run).
+    Skipped,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -275,15 +286,13 @@ pub struct Report {
     pub live_endpoint: Option<String>,
 }
 
-/// Reduction of `variant` relative to `native`; negative when the variant is larger.
-fn pct(native: usize, variant: usize) -> String {
+/// Token reduction of `variant` relative to `native`: `100 * (1 - variant / native)`, negative
+/// when the variant is larger.
+pub fn pct(native: usize, variant: usize) -> String {
     if native == 0 {
         return "n/a".into();
     }
-    format!(
-        "{:+.1}%",
-        100.0 * (native as f64 - variant as f64) / native as f64
-    )
+    format!("{:+.1}%", 100.0 * (1.0 - variant as f64 / native as f64))
 }
 
 fn median(mut v: Vec<u128>) -> u128 {
@@ -294,29 +303,32 @@ fn median(mut v: Vec<u128>) -> u128 {
     v[v.len() / 2]
 }
 
-fn adherence(
+/// Live correctness for one variant: `matched / attempted`, where attempted counts every case
+/// whose request produced a reply (matched, mismatched, or an output the rules rejected).
+pub fn adherence(
     cases: &[&CaseMeasurement],
     pick: fn(&LiveAdherence) -> Option<&VariantLive>,
 ) -> String {
-    let mut matched = 0;
-    let mut judged = 0;
-    let mut errors = 0;
+    let (mut matched, mut mismatched, mut output_failures, mut transport, mut skipped) =
+        (0, 0, 0, 0, 0);
     for c in cases {
-        if let Some(live) = c.live.as_ref().and_then(pick) {
-            match live.matched {
-                Some(true) => {
-                    matched += 1;
-                    judged += 1;
-                }
-                Some(false) => judged += 1,
-                None => errors += 1,
-            }
+        match c.live.as_ref().and_then(pick) {
+            None => {}
+            Some(VariantLive::Matched) => matched += 1,
+            Some(VariantLive::Mismatched) => mismatched += 1,
+            Some(VariantLive::OutputFailure(_)) => output_failures += 1,
+            Some(VariantLive::TransportError(_)) => transport += 1,
+            Some(VariantLive::Skipped) => skipped += 1,
         }
     }
-    if judged + errors == 0 {
+    let attempted = matched + mismatched + output_failures;
+    if attempted + transport + skipped == 0 {
         return "not run".into();
     }
-    format!("{matched}/{judged} matched ({errors} with transport errors)")
+    format!(
+        "{matched}/{attempted} matched ({mismatched} mismatched, {output_failures} output failures; \
+{transport} transport errors, {skipped} skipped)"
+    )
 }
 
 /// Render the report. Every number is an output of this run; nothing is estimated.
@@ -461,26 +473,11 @@ form, which is not public.\n",
             .map(|(c, l)| {
                 let cell = |v: &Option<VariantLive>| match v {
                     None => "-".to_owned(),
-                    Some(VariantLive {
-                        matched: Some(true),
-                        ..
-                    }) => "match".to_owned(),
-                    Some(VariantLive {
-                        matched: Some(false),
-                        error: Some(e),
-                    }) => format!("no ({e})"),
-                    Some(VariantLive {
-                        matched: Some(false),
-                        error: None,
-                    }) => "no".to_owned(),
-                    Some(VariantLive {
-                        matched: None,
-                        error: Some(e),
-                    }) => format!("error ({e})"),
-                    Some(VariantLive {
-                        matched: None,
-                        error: None,
-                    }) => "error".to_owned(),
+                    Some(VariantLive::Matched) => "match".to_owned(),
+                    Some(VariantLive::Mismatched) => "mismatch".to_owned(),
+                    Some(VariantLive::OutputFailure(e)) => format!("output failure ({e})"),
+                    Some(VariantLive::TransportError(e)) => format!("transport error ({e})"),
+                    Some(VariantLive::Skipped) => "skipped".to_owned(),
                 };
                 format!(
                     "| {} | {} | {} | {} |",
@@ -506,25 +503,23 @@ form, which is not public.\n",
     out
 }
 
-/// Attach a live verdict for one variant of one case.
-pub fn record_live(
-    measurement: &mut CaseMeasurement,
-    variant: &str,
+/// Turn a judged reply into a verdict: `Ok(calls)` is compared with the expected calls, `Err`
+/// (decoding, validation or an unfinished completion) is an output failure.
+pub fn verdict(
     judged: Result<Vec<(String, Value)>, String>,
     expected: &[ExpectedCall],
     rules: Option<&Value>,
-) {
+) -> VariantLive {
+    match judged {
+        Ok(actual) if calls_match(expected, &actual, rules) => VariantLive::Matched,
+        Ok(_) => VariantLive::Mismatched,
+        Err(e) => VariantLive::OutputFailure(e),
+    }
+}
+
+/// Attach a live verdict for one variant of one case.
+pub fn record_live(measurement: &mut CaseMeasurement, variant: &str, verdict: VariantLive) {
     let live = measurement.live.get_or_insert_with(LiveAdherence::default);
-    let verdict = match judged {
-        Ok(actual) => VariantLive {
-            matched: Some(calls_match(expected, &actual, rules)),
-            error: None,
-        },
-        Err(e) => VariantLive {
-            matched: None,
-            error: Some(e),
-        },
-    };
     match variant {
         "native" => live.native = Some(verdict),
         "toon" => live.toon = Some(verdict),
@@ -673,8 +668,6 @@ mod tests {
         );
         assert!(md.contains("| w | "));
         assert!(md.contains("Live adherence: native not run; TOON not run; compact not run"));
-        assert_eq!(pct(100, 120), "-20.0%");
-        assert_eq!(pct(100, 70), "+30.0%");
     }
 
     #[test]
@@ -707,35 +700,37 @@ mod tests {
     }
 
     #[test]
-    fn live_verdicts_are_recorded_per_variant() {
-        let c = case(
-            "w",
-            &["get_weather", "get_forecast"],
-            vec![ExpectedCall {
-                name: "get_weather".into(),
-                arguments: json!({"city": "Paris"}),
-            }],
-        );
+    fn live_verdicts_are_recorded_per_variant_and_the_denominator_is_every_attempt() {
+        let expected = vec![ExpectedCall {
+            name: "get_weather".into(),
+            arguments: json!({"city": "Paris"}),
+        }];
+        let c = case("w", &["get_weather", "get_forecast"], expected.clone());
         let mut m = measure_case(&c, "dev", &catalog(), "m", 100, &Whitespace, None).unwrap();
         record_live(
             &mut m,
             "native",
-            Ok(vec![("get_weather".into(), json!({"city": "Paris"}))]),
-            &c.expected,
-            None,
+            verdict(
+                Ok(vec![("get_weather".into(), json!({"city": "Paris"}))]),
+                &expected,
+                None,
+            ),
         );
         record_live(
             &mut m,
             "compact",
-            Err("incomplete_completion".into()),
-            &c.expected,
-            None,
+            verdict(Err("incomplete_completion".into()), &expected, None),
+        );
+        record_live(
+            &mut m,
+            "toon",
+            VariantLive::TransportError("http 500".into()),
         );
         let live = m.live.clone().unwrap();
-        assert_eq!(live.native.unwrap().matched, Some(true));
+        assert_eq!(live.native, Some(VariantLive::Matched));
         assert_eq!(
-            live.compact.unwrap().error.as_deref(),
-            Some("incomplete_completion")
+            live.compact,
+            Some(VariantLive::OutputFailure("incomplete_completion".into()))
         );
         let report = Report {
             cases: vec![m],
@@ -745,8 +740,67 @@ mod tests {
             live_endpoint: Some("http://e".into()),
         };
         let md = render_markdown(&report);
-        assert!(md.contains("native 1/1 matched (0 with transport errors)"));
-        assert!(md.contains("compact 0/0 matched (1 with transport errors)"));
-        assert!(md.contains("| w | match | - | error (incomplete_completion) |"));
+        assert!(md.contains(
+            "native 1/1 matched (0 mismatched, 0 output failures; 0 transport errors, 0 skipped)"
+        ));
+        assert!(md.contains(
+            "compact 0/1 matched (0 mismatched, 1 output failures; 0 transport errors, 0 skipped)"
+        ));
+        assert!(md.contains(
+            "TOON 0/0 matched (0 mismatched, 0 output failures; 1 transport errors, 0 skipped)"
+        ));
+        assert!(md.contains(
+            "| w | match | transport error (http 500) | output failure (incomplete_completion) |"
+        ));
+    }
+
+    #[test]
+    fn one_match_and_nine_decoding_errors_is_one_in_ten() {
+        let expected = vec![ExpectedCall {
+            name: "get_weather".into(),
+            arguments: json!({"city": "Paris"}),
+        }];
+        let mut cases = Vec::new();
+        for i in 0..10 {
+            let c = case(
+                &format!("c{i}"),
+                &["get_weather", "get_forecast"],
+                expected.clone(),
+            );
+            let mut m = measure_case(&c, "dev", &catalog(), "m", 100, &Whitespace, None).unwrap();
+            let judged = if i == 0 {
+                Ok(vec![("get_weather".into(), json!({"city": "Paris"}))])
+            } else {
+                Err("malformed_call".into())
+            };
+            record_live(&mut m, "compact", verdict(judged, &expected, None));
+            cases.push(m);
+        }
+        // Two more cases never produced a reply: they are reported beside the rate, not inside it.
+        let c = case("t", &["get_weather", "get_forecast"], expected.clone());
+        let mut m = measure_case(&c, "dev", &catalog(), "m", 100, &Whitespace, None).unwrap();
+        record_live(
+            &mut m,
+            "compact",
+            VariantLive::TransportError("timeout".into()),
+        );
+        cases.push(m);
+        let c = case("s", &["get_weather", "get_forecast"], expected.clone());
+        let mut m = measure_case(&c, "dev", &catalog(), "m", 100, &Whitespace, None).unwrap();
+        record_live(&mut m, "compact", VariantLive::Skipped);
+        cases.push(m);
+        let refs: Vec<&CaseMeasurement> = cases.iter().collect();
+        assert_eq!(
+            adherence(&refs, |l| l.compact.as_ref()),
+            "1/10 matched (0 mismatched, 9 output failures; 1 transport errors, 1 skipped)"
+        );
+    }
+
+    #[test]
+    fn reduction_is_one_minus_the_ratio_and_keeps_its_sign() {
+        assert_eq!(pct(100, 120), "-20.0%");
+        assert_eq!(pct(100, 70), "+30.0%");
+        assert_eq!(pct(100, 100), "+0.0%");
+        assert_eq!(pct(0, 5), "n/a");
     }
 }

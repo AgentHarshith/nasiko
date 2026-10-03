@@ -2119,6 +2119,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_oversized_native_tool_call_is_a_502_and_releases_nothing() {
+        let big = format!(
+            "{{\"city\":\"{}\"}}",
+            "x".repeat(nasiko_tool_compact::limits::MAX_ARGS_BYTES)
+        );
+        let upstream = reply(
+            Value::Null,
+            json!("tool_calls"),
+            Some(json!([
+                {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}},
+                {"id": "c2", "type": "function", "function": {"name": "get_weather", "arguments": big}}
+            ])),
+        );
+        let (_, result) = exchange(
+            true,
+            &plain_store(),
+            InboundFormat::OpenAi,
+            tools_request(),
+            upstream,
+        )
+        .await;
+        assert_eq!(decode_failure(result), "limit_exceeded");
+    }
+
+    #[tokio::test]
     async fn valid_native_tool_calls_from_the_provider_are_validated_and_kept() {
         let upstream = reply(
             Value::Null,

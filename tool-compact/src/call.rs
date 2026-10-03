@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::catalog::Catalog;
 use crate::error::{Result, ToolCompactError};
 use crate::json::{canonical_json, parse_object_unique};
+use crate::limits::{MAX_ARGS_BYTES, MAX_CALLS, MAX_TOTAL_ARGS_BYTES};
 use crate::types::{ToolCall, ToolDef};
 use crate::validate::validate;
 
@@ -18,7 +19,8 @@ pub fn encode_call(name: &str, arguments: &Value) -> String {
 
 /// Validate a call given as a tool name and a JSON-text argument object.
 ///
-/// Same rules as the decoder: unknown name → `unknown_tool`; malformed JSON or duplicate keys →
+/// Same rules and limits as the decoder: arguments above `MAX_ARGS_BYTES` → `limit_exceeded`
+/// before anything is parsed; unknown name → `unknown_tool`; malformed JSON or duplicate keys →
 /// `malformed_call`; schema violation → `invalid_arguments`. An unsupported catalog is an error
 /// here too, never a reason to skip validation.
 pub fn validate_call(name: &str, arguments_json: &str, tools: &[ToolDef]) -> Result<ToolCall> {
@@ -26,7 +28,35 @@ pub fn validate_call(name: &str, arguments_json: &str, tools: &[ToolDef]) -> Res
     validate_in(&catalog, name, arguments_json)
 }
 
+/// Validate a whole batch of calls that arrived together (a provider's native `tool_calls`).
+///
+/// The batch limits the stream decoder enforces apply here too, and before any call is parsed:
+/// more than `MAX_CALLS` calls or more than `MAX_TOTAL_ARGS_BYTES` of arguments in total →
+/// `limit_exceeded`. Atomic: any failing call fails the batch and nothing is returned.
+pub fn validate_calls(calls: &[(&str, &str)], tools: &[ToolDef]) -> Result<Vec<ToolCall>> {
+    if calls.len() > MAX_CALLS {
+        return Err(ToolCompactError::limit("MAX_CALLS", MAX_CALLS));
+    }
+    let total: usize = calls
+        .iter()
+        .fold(0usize, |acc, (_, args)| acc.saturating_add(args.len()));
+    if total > MAX_TOTAL_ARGS_BYTES {
+        return Err(ToolCompactError::limit(
+            "MAX_TOTAL_ARGS_BYTES",
+            MAX_TOTAL_ARGS_BYTES,
+        ));
+    }
+    let catalog = Catalog::compile(tools)?;
+    calls
+        .iter()
+        .map(|(name, args)| validate_in(&catalog, name, args))
+        .collect()
+}
+
 pub(crate) fn validate_in(catalog: &Catalog, name: &str, arguments_json: &str) -> Result<ToolCall> {
+    if arguments_json.len() > MAX_ARGS_BYTES {
+        return Err(ToolCompactError::limit("MAX_ARGS_BYTES", MAX_ARGS_BYTES));
+    }
     let Some(tool) = catalog.get(name) else {
         return Err(ToolCompactError::UnknownTool {
             name: name.to_owned(),

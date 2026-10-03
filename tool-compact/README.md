@@ -60,7 +60,8 @@ tools out before calling this crate.
 | `decode_tools(&CompactTools) -> Result<Vec<ToolDef>>` | Parse the compact **text** back. For every accepted catalog, `decode_tools(&encode_tools(t)?)? == t`. |
 | `decode_calls(text, &[ToolDef]) -> Result<Decoded>` | Decode a whole reply. Equivalent to one `push` and `finish`. |
 | `StreamDecoder::new(&[ToolDef])`, `push(&str)`, `finish()` | Incremental decoding. Catalog errors surface at `new`. |
-| `validate_call(name, arguments_json, &[ToolDef]) -> Result<ToolCall>` | The decoder's validation applied to a call that arrived in another shape (a provider's native tool call). |
+| `validate_call(name, arguments_json, &[ToolDef]) -> Result<ToolCall>` | The decoder's validation and per-call limits applied to a call that arrived in another shape (a provider's native tool call). |
+| `validate_calls(&[(name, arguments_json)], &[ToolDef]) -> Result<Vec<ToolCall>>` | A whole native batch: `MAX_CALLS` and `MAX_TOTAL_ARGS_BYTES` are checked before any call is parsed; any failing call fails the batch. |
 | `encode_call(name, &Value) -> String` | The one renderer of the call grammar (used by evaluation fixtures). |
 | `canonical_json(&Value) -> String` | Compact JSON with recursively sorted keys. |
 | `HEADER`, `INSTRUCTIONS`, `limits::*` | The framing text and every bound. |
@@ -225,7 +226,9 @@ Error messages carry the tool name, a JSON-pointer path and a reason, never the 
 | `invalid_catalog` | duplicate or invalid tool names; a compact line that does not parse |
 
 Calls are validated as each `>>` arrives but released only by `finish`. A valid first call
-followed by an invalid second call releases nothing.
+followed by an invalid second call releases nothing. `validate_call` and `validate_calls` apply
+the same per-call and batch limits to calls that did not come through the decoder, with the size
+checks done before parsing, so a native batch can never exceed what the decoder would accept.
 
 ## Limits
 

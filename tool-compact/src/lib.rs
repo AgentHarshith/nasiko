@@ -56,7 +56,7 @@ mod stream;
 mod types;
 mod validate;
 
-pub use call::{encode_call, validate_call};
+pub use call::{encode_call, validate_call, validate_calls};
 pub use encode::{decode_tools, encode_tools};
 pub use error::{Result, ToolCompactError};
 pub use instructions::{HEADER, INSTRUCTIONS};

@@ -5,6 +5,7 @@ mod common;
 use common::tool;
 use nasiko_tool_compact::{
     StreamDecoder, ToolCompactError, ToolDef, decode_calls, encode_call, limits, validate_call,
+    validate_calls,
 };
 use serde_json::{Value, json};
 
@@ -380,4 +381,103 @@ fn encode_call_renders_what_the_decoder_accepts() {
     let d = decode_calls(&text, &catalog()).unwrap();
     assert_eq!(d.calls[0].arguments, args);
     assert_eq!(encode_call("noop", &json!({})), "<<call noop {}>>");
+}
+
+#[test]
+fn native_calls_obey_the_same_limits_as_the_decoder() {
+    let cat = catalog();
+    let ok = r#"{"to":["s"],"subject":"x","body":"b"}"#;
+    // Per-call argument bytes, checked before parsing: an oversized blob of invalid JSON still
+    // reports the limit, never a parse error.
+    let big = format!(
+        "{{\"to\":[\"s\"],\"subject\":\"x\",\"body\":\"{}\"}}",
+        "b".repeat(limits::MAX_ARGS_BYTES)
+    );
+    assert!(matches!(
+        validate_call("send_email", &big, &cat),
+        Err(ToolCompactError::LimitExceeded {
+            limit: "MAX_ARGS_BYTES",
+            ..
+        })
+    ));
+    let garbage = "x".repeat(limits::MAX_ARGS_BYTES + 1);
+    assert!(matches!(
+        validate_call("send_email", &garbage, &cat),
+        Err(ToolCompactError::LimitExceeded {
+            limit: "MAX_ARGS_BYTES",
+            ..
+        })
+    ));
+    let exact = format!(
+        "{{\"to\":[\"s\"],\"subject\":\"x\",\"body\":\"{}\"}}",
+        "b".repeat(limits::MAX_ARGS_BYTES - ok.len() + 1)
+    );
+    assert_eq!(exact.len(), limits::MAX_ARGS_BYTES);
+    assert!(validate_call("send_email", &exact, &cat).is_ok());
+
+    // Call count across the batch.
+    let many: Vec<(&str, &str)> = vec![("noop", "{}"); limits::MAX_CALLS];
+    assert_eq!(
+        validate_calls(&many, &cat).unwrap().len(),
+        limits::MAX_CALLS
+    );
+    let too_many: Vec<(&str, &str)> = vec![("noop", "{}"); limits::MAX_CALLS + 1];
+    assert!(matches!(
+        validate_calls(&too_many, &cat),
+        Err(ToolCompactError::LimitExceeded {
+            limit: "MAX_CALLS",
+            ..
+        })
+    ));
+
+    // Aggregate argument bytes across the batch, checked before any call is parsed.
+    let chunk = format!(
+        "{{\"to\":[\"s\"],\"subject\":\"x\",\"body\":\"{}\"}}",
+        "b".repeat(200 * 1024)
+    );
+    let two: Vec<(&str, &str)> = vec![("send_email", &chunk), ("send_email", &chunk)];
+    assert_eq!(validate_calls(&two, &cat).unwrap().len(), 2);
+    let three: Vec<(&str, &str)> = vec![("send_email", &chunk); 3];
+    assert!(matches!(
+        validate_calls(&three, &cat),
+        Err(ToolCompactError::LimitExceeded {
+            limit: "MAX_TOTAL_ARGS_BYTES",
+            ..
+        })
+    ));
+
+    // A valid call followed by an oversized or invalid one releases nothing.
+    let valid_then_oversized: Vec<(&str, &str)> = vec![("noop", "{}"), ("send_email", &big)];
+    assert!(matches!(
+        validate_calls(&valid_then_oversized, &cat),
+        Err(ToolCompactError::LimitExceeded {
+            limit: "MAX_ARGS_BYTES",
+            ..
+        })
+    ));
+    let valid_then_invalid: Vec<(&str, &str)> = vec![("noop", "{}"), ("send_email", "{}")];
+    assert_eq!(
+        validate_calls(&valid_then_invalid, &cat)
+            .unwrap_err()
+            .kind(),
+        "invalid_arguments"
+    );
+    let valid_then_unknown: Vec<(&str, &str)> = vec![("noop", "{}"), ("nope", "{}")];
+    assert_eq!(
+        validate_calls(&valid_then_unknown, &cat)
+            .unwrap_err()
+            .kind(),
+        "unknown_tool"
+    );
+    // Unsupported catalogs refuse batches too.
+    let unsupported = vec![tool(
+        "set_code",
+        json!({"type": "object", "properties": {"code": {"type": "string", "pattern": "^[A-Z]{3}$"}}}),
+    )];
+    assert_eq!(
+        validate_calls(&[("set_code", r#"{"code":"ABC"}"#)], &unsupported)
+            .unwrap_err()
+            .kind(),
+        "unsupported_schema"
+    );
 }
