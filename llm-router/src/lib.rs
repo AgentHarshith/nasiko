@@ -21,10 +21,14 @@ use axum::{
     Json, Router,
     routing::{get, post},
 };
+use nasiko_pricing::PricingEngine;
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tower_http::decompression::RequestDecompressionLayer;
 
 pub mod auth;
+mod brevity;
+mod compress;
 pub mod config;
 pub mod error;
 pub mod handlers;
@@ -32,8 +36,10 @@ pub mod inbound;
 pub mod inject;
 pub mod ir;
 pub mod providers;
+pub mod recovery;
 pub mod resolver;
 pub mod routing;
+mod savings;
 pub mod usage;
 
 pub use config::GatewayConfig;
@@ -42,8 +48,8 @@ pub use inbound::InboundFormat;
 pub use inject::{LlmInjectCtx, inject_llm_env};
 pub use resolver::{ConfigCache, ResolvedConfig};
 pub use routing::{
-    CellStore, DecisionCache, InMemoryCellStore, NoopCache, PgCellStore, PgTierRegistry,
-    RedisCache, StaticTierRegistry, TierRegistry,
+    AllowAllGate, CellStore, ClassifierSalienceGate, DecisionCache, InMemoryCellStore, NoopCache,
+    PgCellStore, PgTierRegistry, RedisCache, SalienceGate, TierRegistry,
 };
 
 /// Shared context for the LLM router.
@@ -64,13 +70,22 @@ pub struct LlmRouterCtx {
     /// Model-routing decision cache, keyed on `(conv_id, agent_id)`. [`NoopCache`] by
     /// default (every read misses); S3 swaps in a Redis-backed impl when configured.
     pub router_cache: Arc<dyn DecisionCache>,
-    /// Tier→model registry for classified routing. [`PgTierRegistry`] (DB-backed, static
-    /// seed fallback) in production; tests use [`StaticTierRegistry`].
+    /// Tier→model registry for classified routing. [`PgTierRegistry`] in production:
+    /// operator `model_registry` overrides first, then a mapping derived from the
+    /// live provider model catalog (synced from `GET /models`, price-ranked).
     pub tier_registry: Arc<dyn TierRegistry>,
     /// Learned per-provider quality cells behind Thompson-sampling tier selection.
     /// [`PgCellStore`] (durable, cross-instance) in production; tests use
     /// [`InMemoryCellStore`].
     pub cell_store: Arc<dyn CellStore>,
+    /// Level 2.5 salience gate — decides whether a boundary turn is substantive enough to
+    /// classify + pin. [`ClassifierSalienceGate`] when `SALIENCE_GATE_ENABLED`; else [`AllowAllGate`]
+    /// (classify at every boundary, i.e. behaviour before the gate existed).
+    pub salience_gate: Arc<dyn SalienceGate>,
+    /// The platform's single cost engine. Every `token_usage` row is priced
+    /// through this — the DB trigger that used to do it returned NULL for any
+    /// model missing from `model_pricing`, which booked 92.8% of calls at $0.
+    pub pricing: Arc<PricingEngine>,
 }
 
 impl LlmRouterCtx {
@@ -96,14 +111,13 @@ impl LlmRouterCtx {
             llm_gateway_base_url = %cfg.llm_gateway_base_url,
             "llm-router: initializing with effective GatewayConfig"
         );
-        log_seed_registry();
         let cache = Arc::new(ConfigCache::new(Duration::from_secs(
             cfg.llm_config_cache_ttl_secs,
         )));
         let tier_registry = Arc::new(PgTierRegistry::new(db.clone()));
         tracing::info!(
             target: "nasiko::llm_router::startup",
-            "llm-router: tier registry = PgTierRegistry (DB model_registry table, static seeds as fallback)"
+            "llm-router: tier registry = PgTierRegistry (operator model_registry overrides, then live provider catalog ranked by price)"
         );
         let cell_store = Arc::new(PgCellStore::new(db.clone()));
         tracing::info!(
@@ -111,14 +125,82 @@ impl LlmRouterCtx {
             "llm-router: cell store = PgCellStore (DB router_quality_cells table; learns per-provider tier quality from feedback)"
         );
         let router_cache = build_router_cache(&cfg);
+        let cfg = Arc::new(cfg);
+        let salience_gate = build_salience_gate(&cfg);
+        let pricing = Arc::new(PricingEngine::new(db.clone()));
         Self {
             db,
             http,
-            cfg: Arc::new(cfg),
+            cfg,
             cache,
             router_cache,
             tier_registry,
             cell_store,
+            salience_gate,
+            pricing,
+        }
+    }
+}
+
+/// Build the Level 2.5 salience gate from config.
+///
+/// [`AllowAllGate`] when `SALIENCE_GATE_ENABLED=false`; otherwise
+/// [`ClassifierSalienceGate`] over the model embedded in this binary, or over
+/// `SALIENCE_WEIGHTS_PATH` when that override is set.
+///
+/// A model that cannot be loaded (a corrupt embedded asset, or a missing/malformed override
+/// file) logs a warning and degrades to [`AllowAllGate`] — the router classifies at every
+/// fireable boundary, exactly as it did before the gate existed. That is the same fail-safe
+/// direction the gate itself takes: nothing defers a turn unless a model confidently says
+/// it is small talk, so a gate that cannot run costs money, never availability.
+fn build_salience_gate(cfg: &Arc<GatewayConfig>) -> Arc<dyn SalienceGate> {
+    if !cfg.salience_gate_enabled {
+        tracing::info!(
+            target: "nasiko::llm_router::startup",
+            "llm-router: salience gate = AllowAllGate (SALIENCE_GATE_ENABLED=false; classify at every fireable boundary)"
+        );
+        return Arc::new(AllowAllGate);
+    }
+
+    let (source, loaded) = if cfg.salience_weights_path.is_empty() {
+        (
+            "embedded",
+            ClassifierSalienceGate::embedded(
+                cfg.salience_low_threshold,
+                cfg.salience_high_threshold,
+            ),
+        )
+    } else {
+        (
+            cfg.salience_weights_path.as_str(),
+            ClassifierSalienceGate::from_path(
+                &cfg.salience_weights_path,
+                cfg.salience_low_threshold,
+                cfg.salience_high_threshold,
+            ),
+        )
+    };
+
+    match loaded {
+        Ok((gate, trained_at)) => {
+            tracing::info!(
+                target: "nasiko::llm_router::startup",
+                weights_source = source,
+                model_trained_at = %trained_at,
+                low_threshold = cfg.salience_low_threshold,
+                high_threshold = cfg.salience_high_threshold,
+                "llm-router: salience gate = ClassifierSalienceGate (Level 2.5 enabled; small talk answered cheaply without pinning, no LLM call in the hot path)"
+            );
+            Arc::new(gate)
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "nasiko::llm_router::startup",
+                weights_source = source,
+                error = %e,
+                "llm-router: salience model failed to load; falling back to AllowAllGate (classify at every fireable boundary)"
+            );
+            Arc::new(AllowAllGate)
         }
     }
 }
@@ -153,24 +235,6 @@ fn build_router_cache(cfg: &GatewayConfig) -> Arc<dyn DecisionCache> {
     }
 }
 
-/// Log the built-in static tier→model seed table at startup, so the effective
-/// `(provider, tier)` → model mapping is visible without a DB round-trip. The DB
-/// `model_registry` table (migration 018) can override any of these per row.
-fn log_seed_registry() {
-    use routing::Tier;
-    for provider in ["anthropic", "openai"] {
-        for tier in [Tier::Tier1, Tier::Tier2, Tier::Tier3] {
-            if let Some(model) = StaticTierRegistry::seed(provider, tier) {
-                tracing::info!(
-                    target: "nasiko::llm_router::startup",
-                    %provider, tier = ?tier, tier_level = tier.as_level(), %model,
-                    "llm-router: static tier seed (DB model_registry may override)"
-                );
-            }
-        }
-    }
-}
-
 /// Build the LLM router.
 ///
 /// Mounted at the host's top level (outside user-session auth) — the agent-identity
@@ -186,6 +250,7 @@ pub fn router(ctx: LlmRouterCtx) -> Router {
             "/v1/chat/completions",
             post(handlers::chat::chat_completions),
         )
+        .route("/v1/responses", post(handlers::responses::responses))
         // Anthropic Messages surface — an Anthropic-SDK agent (`ANTHROPIC_BASE_URL`)
         // POSTs here; the inbound parser normalizes to the same IR (P2.3).
         .route("/v1/messages", post(handlers::chat::messages))
@@ -199,9 +264,48 @@ pub fn router(ctx: LlmRouterCtx) -> Router {
         .route("/v1/embeddings", post(handlers::embeddings::embeddings))
         .route("/v1/models", get(handlers::models::models))
         .with_state(ctx)
+        .layer(RequestDecompressionLayer::new())
 }
 
 /// `GET /v1/health` → `{"status":"ok"}`.
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::{Value, json};
+    use std::future::poll_fn;
+    use tower::Service;
+    use tower_http::decompression::RequestDecompressionLayer;
+
+    #[tokio::test]
+    async fn request_decompression_accepts_codex_zstd_json() {
+        async fn echo(Json(value): Json<Value>) -> Json<Value> {
+            Json(value)
+        }
+
+        let mut app = Router::new()
+            .route("/responses", post(echo))
+            .layer(RequestDecompressionLayer::new());
+        let expected =
+            json!({"model":"gpt-5.4","stream":true,"input":[{"role":"user","content":"hello"}]});
+        let compressed = zstd::stream::encode_all(expected.to_string().as_bytes(), 1).unwrap();
+        let request = Request::post("/responses")
+            .header("content-type", "application/json")
+            .header("content-encoding", "zstd")
+            .body(Body::from(compressed))
+            .unwrap();
+        poll_fn(|context| <Router as Service<Request<Body>>>::poll_ready(&mut app, context))
+            .await
+            .unwrap();
+        let response = app.call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
+    }
 }
