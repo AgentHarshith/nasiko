@@ -419,7 +419,7 @@ async fn chat_core(
     llm_span.record("gen_ai.response.model", model.as_str());
     record_span_usage(&llm_span, resp.usage.as_ref());
 
-    usage::spawn_log(
+    usage::spawn_log_with(
         ctx.db.clone(),
         ctx.pricing.clone(),
         UsageRecord {
@@ -441,8 +441,8 @@ async fn chat_core(
             brevity_metadata: brevity_metadata.clone(),
             compress_bytes,
             request_bytes: Some(sent_bytes),
-            compact_tools_metadata,
         },
+        compact_tools_metadata,
     );
 
     if let Some(Err(failure)) = compact_outcome {
@@ -754,7 +754,7 @@ impl Drop for UsageGuard {
         let compact_tools_metadata = self.compact_tools_metadata.take();
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         record_span_usage(&self.span, st.usage.as_ref());
-        usage::spawn_log(
+        usage::spawn_log_with(
             self.db.clone(),
             self.pricing.clone(),
             UsageRecord {
@@ -776,8 +776,8 @@ impl Drop for UsageGuard {
                 brevity_metadata,
                 compress_bytes: self.compress_bytes,
                 request_bytes: self.request_bytes,
-                compact_tools_metadata,
             },
+            compact_tools_metadata,
         );
     }
 }

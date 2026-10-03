@@ -69,18 +69,27 @@ pub struct UsageRecord {
     /// Total text bytes actually sent, after compression and the brevity directive. Calibrates
     /// chars-per-token against this very call rather than a fixed divisor (see `savings.rs`).
     pub request_bytes: Option<usize>,
-    /// Pre-serialized `metadata.compact_tools` block (`compact_tools.rs`).
-    ///
-    /// `None` while the feature is off, so the row stays byte-identical to today's; once the
-    /// fleet flag is on it is always `Some`, recording "applied" or "bypassed, and why" like the
-    /// brevity block does.
-    pub compact_tools_metadata: Option<serde_json::Value>,
 }
 
 /// Spawn the usage write so it never blocks the response.
 pub fn spawn_log(db: PgPool, pricing: Arc<PricingEngine>, record: UsageRecord) {
+    spawn_log_with(db, pricing, record, None);
+}
+
+/// [`spawn_log`] plus the pre-serialized `metadata.compact_tools` block (`compact_tools.rs`).
+///
+/// The block travels beside the record rather than on it so `UsageRecord`'s shape stays what
+/// every other writer (and every test that builds one) already knows. `None` leaves the row
+/// byte-identical to one written through [`spawn_log`]; once the fleet flag is on the chat
+/// handler always passes `Some`, recording "applied" or "bypassed, and why" like the brevity block.
+pub fn spawn_log_with(
+    db: PgPool,
+    pricing: Arc<PricingEngine>,
+    record: UsageRecord,
+    compact_tools: Option<serde_json::Value>,
+) {
     tokio::spawn(async move {
-        if let Err(e) = log_usage(db, pricing.as_ref(), record).await {
+        if let Err(e) = log_usage_with(db, pricing.as_ref(), record, compact_tools).await {
             tracing::warn!(error = %e, "llm_usage write failed (swallowed)");
         }
     });
@@ -91,6 +100,16 @@ pub async fn log_usage(
     db: PgPool,
     pricing: &PricingEngine,
     record: UsageRecord,
+) -> Result<(), String> {
+    log_usage_with(db, pricing, record, None).await
+}
+
+/// [`log_usage`] with the optional `metadata.compact_tools` block (see [`spawn_log_with`]).
+pub async fn log_usage_with(
+    db: PgPool,
+    pricing: &PricingEngine,
+    record: UsageRecord,
+    compact_tools: Option<serde_json::Value>,
 ) -> Result<(), String> {
     // token_usage.user_id is NOT NULL + FK to users(id); without a valid owner we
     // cannot write a row, so skip (best-effort logging must never surface an error).
@@ -167,7 +186,7 @@ pub async fn log_usage(
         cache_creation: serde_json::to_value(&cache_details).unwrap_or(serde_json::Value::Null),
         compress: record.compress_metadata,
         brevity: record.brevity_metadata,
-        compact_tools: record.compact_tools_metadata,
+        compact_tools,
     });
 
     sqlx::query(
